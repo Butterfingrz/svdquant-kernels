@@ -135,6 +135,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "smoke_module_e2e.py"),
+        remote_path="/root/svdquant-kernels/tmp/smoke_module_e2e.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "probe_gemm_v0_fa4.py"),
         remote_path="/root/svdquant-kernels/tmp/probe_gemm_v0_fa4.py",
         copy=False,
@@ -339,6 +344,17 @@ def gemm_v2_fa4_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v2_fa4.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=1800)
+def module_e2e_smoke() -> None:
+    """SVDQuantW4A4Linear end-to-end: Triton quantize+LoRA-down → CuTe
+    DSL gemm_w4a4 v2_fa4. Verifies the nn.Module forward() against the
+    pure-PyTorch reference chain on fp16 and bf16."""
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/smoke_module_e2e.py"], check=True
     )
 
 

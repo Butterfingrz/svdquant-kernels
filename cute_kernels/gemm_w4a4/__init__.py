@@ -4,5 +4,6 @@ See `docs/kernels/gemm_w4a4.md` for the full design (β interleave,
 shared-tmem accumulator, warp-spec split).
 """
 from .kernel import launch
+from .module import SVDQuantW4A4Linear
 
-__all__ = ["launch"]
+__all__ = ["launch", "SVDQuantW4A4Linear"]
