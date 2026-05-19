@@ -420,3 +420,112 @@ treat the bench number as "kernel + launch tax" and the ncu number as
 Reports kept at
 `log/ncu_v2_{preLUfix,postLUfix}_4352_3840_3072_R128.ncu-rep` and the
 text excerpt at `log/verda_ncu_lufix_ab.log`.
+
+## Epilogue precision: fp16 vs fp32
+
+nunchaku casts `fp32 → fp16` immediately after the main `tcgen05`
+fp32 accumulator and runs the **entire** post-MMA chain (LoRA-up,
+`wcscales`, bias) in fp16 (`gemm_w4a4.cuh:351`,
+`gemm_base.cuh:711-770`):
+
+```cpp
+auto f16psum = packed_fp32_to_fp16(fpsum);        // gemm_w4a4.cuh:351
+Epilogue()(binfo, f16psum, ...);                  // LoRA + Bias all fp16
+fsum.data[0] = __hfma2(fsum.data[0], s1, b1);     // wcscales×y + bias
+```
+
+This is a **consumer-Blackwell** tradeoff: on SM_120 / SM_121
+(RTX 50-series, RTX-PRO 6000), non-FP4 fp32-accumulate paths run at
+**half rate** vs fp16-accumulate — Nvidia gates the fp32-accum tensor
+throughput on consumer parts. Doing the epilogue in fp16 keeps the
+post-MMA work on the full-rate path.
+
+**Data-center Blackwell (SM_100 / SM_103, B200) is NOT throttled.**
+fp32 epilogue runs at the same throughput as fp16. So our CuTe DSL
+kernel runs the epilogue in fp32 until the final store — we don't
+inherit nunchaku's tradeoff and don't lose anything by skipping it.
+
+Numerical consequence in cross-validate vs nunchaku
+(`tmp/smoke_nvfp4_vs_nunchaku.py`, SM_120 local):
+
+| config | rel_max | rel_mean | source |
+|---|---:|---:|---|
+| min  (smooth=1, bias=0, wcscales=1, no LoRA) | 8.8 %  | 1.2 % | one fp32→fp16 cast difference at line 351 |
+| full (random affine + LoRA) | 35.7 % | 3.7 % | + fp16 epilogue FMA noise stacked over R-dot + wcscales + bias |
+
+The activation-quantize side is **not** a contributor —
+`quantize_w4a4_fp4_from_fpsum_warp` (`gemm_w4a4.cuh:85-187`) uses
+NUM_GROUPS=4 with `__shfl_xor` reduce across the 4-lane quad, giving
+strict per-row-per-16-K-block amax, identical to our Triton convention.
+(`bench_fused.py:17-25` warp-fragment-amax comment refers to the INT4
+path, group_size=64 — does not apply to FP4.)
+
+Implication for end-to-end quality: deepcompressor calibration assumes
+per-row-per-16-K-block (NVFP4 standard). Both nunchaku and ours follow
+that. The fp16 vs fp32 epilogue is independent — ours preserves more
+precision in LoRA-up / affine fold-in, marginally better on the
+calibration's loss surface, but the difference is well below the noise
+floor of any image-quality metric.
+
+## Cross-arch MFU caveat
+
+Cross-chip MFU (FLOPS / device peak) is **not a kernel-quality metric**
+when one side is consumer-Blackwell and the other is data-center
+Blackwell. Two unrelated knobs move:
+
+1. **Sustained clock**. B200 sustains its boost clock at the rated
+   number; RTX-PRO 6000 / RTX 50-series boost clocks swing wide with
+   thermal envelope and per-die binning. The "peak FLOPS" denominator
+   in NV's spec sheet is one specific clock; the runtime may be above
+   or below. Consumer-card MFU readings can briefly exceed 100 % or
+   sit well under, neither reflecting code quality.
+2. **fp32-accum throttle**. Consumer parts halve non-FP4 fp32-accum
+   tensor throughput vs fp16-accum (see § *Epilogue precision*).
+   Whether the "peak" denominator factors this in depends on which
+   row of the spec sheet you read.
+
+Replace MFU with `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_*`
+for cross-arch comparison. ncu computes this against each device's
+**per-cycle** tensor-pipe ceiling — clock-independent. Two flavours:
+
+- `..._active` — over cycles when the SM has work, how often the
+  tensor pipe is busy. Reads kernel instruction density / arith mix.
+- `..._elapsed` — over the kernel's full wall time, same numerator.
+  Reads end-to-end tensor pipeline saturation.
+
+### Same shape (M=4352 K=3840 N=3072 R=128), three reports
+
+| Kernel             | Device              | dtype | Duration   | Tensor (active) | Tensor (elapsed) |
+| ------------------ | ------------------- | ----- | ---------: | --------------: | ---------------: |
+| v2_fa4 (post-LU)   | B200, SM_100        | fp16  |   32.13 µs |    52.0 %       |      45.2 %      |
+| nunchaku           | RTX PRO 6000, SM_120a | fp16 |  185.25 µs |    58.8 %       |      45.4 %      |
+| nunchaku           | RTX PRO 6000, SM_120a | bf16 |  157.54 µs |    73.7 %       |      54.6 %      |
+
+Read:
+- **fp16 elapsed % is the same** within 0.2 pp (45.2 vs 45.4). Both
+  kernels saturate their respective tensor pipes equally over the
+  kernel's run. The 5.8× absolute duration gap = B200 SM count +
+  per-cycle FP4 peak; not a code-quality gap.
+- **fp16 active % differs** (52.0 vs 58.8). nunchaku's hand-PTX
+  packs more tensor work per active cycle; ours has more bubble
+  cycles. That's where DSL-vs-PTX codegen gap shows up.
+- **bf16 nunchaku active 73.7 %** is the fp16-spill-free run.
+  Consumer-Blackwell nunchaku fp16 hits 255 regs + 2.28M LMEM (101%
+  spill overhead, see § *Perf-comparison context* earlier); bf16
+  doesn't. Ours doesn't have this cliff in either dtype.
+
+Caveat the caveat: `peak_sustained_active` is the **per-architecture**
+tensor-pipe peak per cycle. If sm_120a has a lower FP4 peak than
+sm_100, the % still normalizes correctly within each device, but the
+*absolute work* per percentage point differs. Use Tensor % to compare
+implementation density; use duration × device peak to compare absolute
+throughput.
+
+Reports: `log/ncu_v2_postLUfix_4352_3840_3072_R128.ncu-rep` (B200),
+`log/ncu_nunchaku_4352_3840_3072_R128_{fp16,bf16}.ncu-rep` (Verda
+RTX PRO 6000). Extract via:
+
+```
+ncu --import <file> --page raw 2>/dev/null \
+  | grep -E 'sm__pipe_tensor_cycles_active.avg|gpu__time_duration.avg'
+```

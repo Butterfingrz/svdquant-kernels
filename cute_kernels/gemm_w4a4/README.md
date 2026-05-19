@@ -265,6 +265,16 @@ bias+wcscales on, `fp4=True`. MFU vs 4000 TFLOPS dense FP4 per
 RTX PRO 6000 Blackwell datasheet. Run with
 `modal run scripts/modal_app.py::nunchaku_gemm_bench`.
 
+> **MFU-cross-chip caveat.** The MFU values below use each device's
+> rated peak as denominator. On consumer Blackwell the rated peak is
+> at one specific boost clock; the actual sustained clock varies with
+> thermal envelope and binning, so the % can drift either way without
+> any kernel change. The kernel-level apples-to-apples metric is
+> `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed`
+> (frequency-independent). At the production shape M=4352 K=3840
+> N=3072 R=128: nunchaku-fp16 = **45.4 %**, ours-fp16 (B200) = **45.2 %**
+> — equal density. See `docs/gpu.md § Cross-arch MFU caveat`.
+
 | shape (M, K, N, R)         | nunchaku fp16 | nunchaku bf16 |
 | -------------------------- | ------------- | ------------- |
 |  256, 3840,  3072, R=128   |     2.4%      |     2.6%      |

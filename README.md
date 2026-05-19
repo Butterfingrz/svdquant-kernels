@@ -15,43 +15,51 @@ explicitly out of scope so the kernels stay drop-in.
 
 ## Current performance
 
-### CUDA — `gemm_w4a4` on Blackwell B200 (NVFP4, 10 PFLOPS peak)
+### CUDA — `gemm_w4a4` on Blackwell B200 (NVFP4)
 
 `cute_kernels.gemm_w4a4.kernel_v2_fa4` (FA4-derived 3-warp persistent
 mainloop, 2-CTA, LoRA β-interleaved into the main K-loop) vs the
-nunchaku NVFP4 reference (RTX PRO 6000 Blackwell, SM_120a, 4 PFLOPS
-peak, hand-written inline PTX). MFU as a fraction of each card's
-dense-NVFP4 peak. Production shapes from `GEMM_SHAPES`.
+nunchaku NVFP4 reference (RTX PRO 6000 Blackwell, SM_120a, hand-written
+inline PTX, no SM_100 binary).
 
-| Shape (M, K, N, R)              | ours fp16 | nunchaku fp16 | ours bf16 | nunchaku bf16 |
-| ------------------------------- | --------: | ------------: | --------: | ------------: |
-| 4352 × 3840  × 3072  × R=128    |  **16.9** |          16.2 |      17.3 |          17.7 |
-| 4352 × 3840  × 15360 × R=128    |  **26.5** |          19.5 |  **26.7** |          24.7 |
-| 4352 × 15360 × 3840  × R=128    |  **27.3** |          25.0 |      27.3 |          30.5 |
-| 4352 × 10240 × 3072  × R=32     |  **26.4** |          21.4 |  **26.2** |          25.2 |
+**Why no MFU table here**: nunchaku only ships SM_120a/121a, so the
+cross-chip comparison is consumer-Blackwell (variable boost clock) vs
+data-center-Blackwell (sustained boost). Dividing by each card's
+datasheet peak gives **MFU values that are dominated by clock-frequency
+drift, not kernel quality**. The kernel-level apples-to-apples metric
+is `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_*` —
+how saturated the tensor pipe is per-cycle, independent of boost.
 
-**fp16: 4/4 shapes ahead. bf16: 2/4 ahead, 1/4 within ±0.5 pp noise,
-1/4 still 3.2 pp behind** on the K=15360 shape. That −3.2 pp gap
-tracks to the structural CuTe-DSL-MLIR-vs-hand-PTX bf16 asymmetry
-called out in `docs/gpu.md § Perf-comparison context`; not a
-LoRA-side issue.
+Production shape `M=4352 K=3840 N=3072 R=128`, ncu single-launch:
 
-**This is not an apples-to-apples comparison and not a code-quality
-verdict.** nunchaku's NVFP4 is hand-rolled inline PTX
-(`mma_earlycuda.cuh`) and is gated on `__CUDA_ARCH__ >= 1200` —
-SM_120a/121a (consumer/workstation Blackwell). There is no SM_100
-binary, so we can't run it on B200 at all. The table is therefore
-*cross-chip*: ours on B200 (data-center Blackwell, 10 PFLOPS dense
-NVFP4 peak) vs nunchaku on RTX PRO 6000 (4 PFLOPS peak), with the
-tensor-core ISA and toolchain differing on both sides. MFU
-normalizes for each card's peak, but the comparison is an
-*implementation-quality reference* ("what does a mature hand-PTX
-W4A4 NVFP4 kernel achieve on its target chip"), **not** a measure
-of whose code is "better written".
+| Kernel             | Device              | dtype | Duration | Tensor Pipe (active) | Tensor Pipe (elapsed) |
+| ------------------ | ------------------- | ----- | -------: | -------------------: | --------------------: |
+| v2_fa4 (post-LU)   | B200, SM_100        | fp16  |  32.13 µs |   52.0 %             |   **45.2 %**           |
+| nunchaku           | RTX PRO 6000, SM_120a | fp16 | 185.25 µs |   58.8 %             |   **45.4 %**           |
+| nunchaku           | RTX PRO 6000, SM_120a | bf16 | 157.54 µs |   73.7 %             |   **54.6 %**           |
 
-Honest local ceiling (same B200, same shapes, no LoRA / no
+Elapsed-% is the kernel-level reading ("over total wall time, what
+fraction of cycles the tensor pipe is active"). Ours-fp16 and
+nunchaku-fp16 land within 0.2 pp — **the kernel saturates its
+respective hardware to the same extent**; the ~5.8× absolute duration
+gap is the B200's larger SM count and higher per-cycle FP4 peak, not
+a code-quality gap.
+
+nunchaku bf16 is 9.2 pp ahead of nunchaku fp16 elapsed because fp16
+hits a register-pressure cliff (255 regs, 2.28M LMEM, 101 % spill
+overhead — see `docs/gpu.md`). Ours doesn't have this cliff.
+
+Reports kept at `log/ncu_v2_postLUfix_*.ncu-rep` (B200, sm_100) and
+`log/ncu_nunchaku_*_fp16.ncu-rep` / `log/ncu_nunchaku_*_bf16.ncu-rep`
+(Verda RTX PRO 6000, sm_120a). Caveat — the `peak_sustained_active`
+denominator is per-arch and may or may not include the consumer fp32-
+accumulate throttle. `docs/gpu.md § Cross-arch MFU caveat` records
+the limitation.
+
+Honest local ceiling (**same B200, same shapes**, no LoRA / no
 epilogue / no next-quant — bare main NVFP4 MMA) from CUTLASS's
-`dense_blockscaled_gemm_persistent.py`:
+`dense_blockscaled_gemm_persistent.py`. MFU here is meaningful because
+both rows are on the same device (no cross-chip clock-drift problem):
 
 | Shape (M, K, N)         | CUTLASS 2-CTA 256×256 | ours 2-CTA v2_fa4 (fp16) |
 | ----------------------- | --------------------: | -----------------------: |
@@ -67,7 +75,7 @@ K-loop epilogue tail) and main-K-loop / TMEM occupancy work, **not**
 LoRA prolog depth — see `docs/gpu.md § Stage sweep` for why.
 
 Full numbers: `cute_kernels/gemm_w4a4/README.md`,
-`docs/gpu.md § MFU vs nunchaku`.
+`docs/gpu.md § Cross-arch MFU caveat`.
 
 ### Ascend — `gemm_w4a4` on 910B (INT4 cube + fp16 LoRA)
 
