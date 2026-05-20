@@ -21,20 +21,33 @@ PTX, kernel docstrings, gotcha docs — best read alongside the repo
 
 ## 1. Preface
 
-![Per-shape MFU vs nunchaku — bold-teal cells mark where we lead](figures/preface_table_en.png)
+![Tensor Pipe % at production shape — ours fp16 and nunchaku fp16 elapsed land within 0.2 pp](figures/preface_table_en.png)
 
-Numbers are MFU (fraction of each chip's dense-NVFP4 peak). **Mind
-the chips**: we run on B200 (SM_100, 10 PFLOPS dense FP4 peak);
-nunchaku's NVFP4 is gated on `__CUDA_ARCH__ >= 1200` and ships only
-SM_120a/121a binaries, so we run it on RTX PRO 6000 (4 PFLOPS peak)
-— two tensor-core ISAs, two toolchains, two generations of Blackwell.
-MFU normalizes for each chip's peak, but **this table is not a
-verdict on whose code is better written** — it is an
-implementation-quality reference ("how fast does mature hand-rolled
-inline PTX go on its own target chip"). Same B200, no LoRA or
-affine, CUTLASS's `dense_blockscaled_gemm_persistent.py` at 2-CTA
-256×256 lands at 45–63 % MFU. *That* is the headroom that still
-matters.
+Numbers come from `ncu`'s
+`sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_*` counter —
+how busy the tensor pipe was on each device's own per-cycle ceiling,
+**clock-independent**. We started with cross-arch MFU but had to drop
+it: nunchaku only ships SM_120a/121a (consumer/workstation Blackwell,
+see `nunchaku/setup.py:41-64`), there is no SM_100 binary, so the
+comparison is inherently data-center-Blackwell vs consumer-Blackwell —
+and consumer boost clocks swing wide enough that MFU readings drift
+more than the kernel-quality signal we wanted (`docs/gpu.md § Cross-arch
+MFU caveat`).
+
+Read it: ours-fp16 and nunchaku-fp16 saturate their respective tensor
+pipes to within 0.2 pp **on each card's own per-cycle peak** —
+both kernels push the hardware they sit on to roughly the same
+fraction of its ceiling. The 5.8× duration gap is the B200's larger
+SM count and higher per-cycle FP4 peak doing its job, not a
+code-quality gap. nunchaku's bf16 elapsed sits 9.2 pp above its fp16
+elapsed because the fp16 path hits a register-pressure cliff
+(255 regs/thread + 2.28 M LMEM spills, full breakdown in §9.2);
+ours has no such cliff in either dtype.
+
+Same B200, no LoRA / no affine / no next-quant, CUTLASS's
+`dense_blockscaled_gemm_persistent.py` at 2-CTA 256×256 lands at
+45–63 % MFU. *That* same-device MFU is unaffected by the cross-chip
+clock-drift problem and is the headroom that still matters.
 
 The op is the compute-bound half of SVDQuant: NVFP4 scaled MMA + a
 small low-rank LoRA residual + a per-column affine. The math fits on
@@ -1033,52 +1046,56 @@ nunchaku NVFP4 is gated on `__CUDA_ARCH__ >= 1200` (SM_120a/121a, see
 `nunchaku/setup.py:41-64`), so we can't run it on B200 — there is
 no nunchaku binary for SM_100. We run it on RTX PRO 6000 Blackwell
 Server Edition (SM_120a) as an *implementation-quality reference*,
-not a ceiling. Hardware peaks differ 2.5× (B200's 10 PFLOPS NVFP4 vs
-PRO 6000's 4 PFLOPS), so MFU comparisons stay apples-to-apples only
-if you stay inside one side's column.
+not a ceiling.
 
-| Shape (M, K, N, R)              | ours fp16 (B200) | nunchaku fp16 (PRO 6000) | Δ pp  | ours bf16 | nunchaku bf16 | Δ pp  |
-| ------------------------------- | ---------------- | ------------------------ | ----- | --------- | ------------- | ----- |
-| 4352 × 3840  × 3072  × R=128    |  **16.9**        |   16.2                   |  +0.7 |   17.3    |   17.7        |  −0.4 |
-| 4352 × 3840  × 15360 × R=128    |  **26.5**        |   19.5                   |  +7.0 |  **26.7** |   24.7        |  +2.0 |
-| 4352 × 15360 × 3840  × R=128    |  **27.3**        |   25.0                   |  +2.3 |   27.3    |   30.5        |  −3.2 |
-| 4352 × 10240 × 3072  × R=32     |  **26.4**        |   21.4                   |  +5.0 |  **26.2** |   25.2        |  +1.0 |
+§1's table is the apples-to-apples readout: `ncu`
+`sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_*` at the
+production shape `M=4352 K=3840 N=3072 R=128`. Three numbers per row,
+three things they tell you:
 
-(Source: `docs/gpu.md:314-319`.) **fp16: 4/4 shapes ahead. bf16: 2/4
-ahead, 1/4 within ±0.5 pp noise, 1/4 still 3.2 pp behind** on the
-M=4352 K=15360 N=3840 shape. That −3.2 pp gap is the "bf16 hand-PTX
-vs DSL MLIR lowering" asymmetry called out in `docs/gpu.md:79-103`:
-nunchaku's MMA is inline PTX (`mma_earlycuda.cuh`), two separately
-hand-tuned paths for fp16 vs bf16 with different register packing
-and acc-precision choices. Ours goes through one `tcgen05` atom with
-`ab_dtype` substitution — same MLIR lowering for both. Closing the
-last 3 pp on bf16 likely requires dropping to inline PTX, which is
-out of scope.
+- **elapsed % is the same** (45.2 vs 45.4). Over the kernel's
+  wall-clock, both kernels saturate their respective tensor pipes
+  to within 0.2 pp. This is the kernel-quality readout — each side
+  pushes the hardware it sits on to the same fraction of its own
+  per-cycle ceiling.
+- **active % differs** (52.0 vs 58.8 on fp16). Over cycles when the
+  SM has work, nunchaku's hand-PTX packs more tensor work per active
+  cycle; ours has more bubble cycles. This is the structural
+  DSL-vs-PTX codegen gap called out in `docs/gpu.md:79-103`:
+  nunchaku's MMA is inline PTX (`mma_earlycuda.cuh`), two separately
+  hand-tuned paths for fp16 and bf16 with different register packing
+  and acc-precision choices; ours goes through one `tcgen05` atom
+  with `ab_dtype` substitution — same MLIR lowering for both.
+  Closing the active % gap likely requires dropping to inline PTX,
+  out of scope.
+- **5.8× duration gap** is hardware capability: B200 SM_100 has more
+  SMs and a higher per-cycle FP4 peak than PRO 6000 SM_120a. Not a
+  code-quality readout.
 
-Absolute throughput at the same shapes (B200 vs PRO 6000, peak ratio
-~2.5×):
+**Why we don't quote cross-arch MFU here.** MFU (FLOPS / device peak)
+needs a stable device peak. Consumer Blackwell (PRO 6000, RTX 50)
+sustained clocks swing wide with thermal envelope and per-die
+binning — the "peak FLOPS" denominator in the spec sheet is one
+specific clock, and the runtime drifts above or below. A 4-shape
+cross-arch MFU table previously lived in this section; we pulled it
+after re-running and finding the clock-drift signal exceeded the
+kernel-quality signal. `docs/gpu.md § Cross-arch MFU caveat` is the
+fuller writeup.
 
-| Shape                           | ours TF (B200) | nunchaku TF (PRO 6000) | ratio |
-| ------------------------------- | -------------- | ---------------------- | ----- |
-| 4352 × 3840  × 3072  × R=128    |   1685         |   ~648                 | 2.60× |
-| 4352 × 3840  × 15360 × R=128    |   2648         |   ~780                 | 3.40× |
-| 4352 × 15360 × 3840  × R=128    |   2735         |  ~1000                 | 2.74× |
-| 4352 × 10240 × 3072  × R=32     |   2645         |   ~856                 | 3.09× |
+**A brief note on nunchaku's fp16 column.** The 9.2 pp gap between
+nunchaku fp16 elapsed (45.4 %) and nunchaku bf16 elapsed (54.6 %)
+**inside their column** is a register-pressure cliff: their fp16
+hand-PTX hits 255 regs/thread + ~2.28 M LMEM spills + 101 % spill
+overhead; the bf16 path is 248 regs and zero spill. The 7-register
+difference is "fits on-chip" vs "doesn't." Ours has neither cliff —
+single `tcgen05` atom + `ab_dtype` substitution goes through the
+same MLIR lowering for both dtypes, so our fp16 elapsed ≈ our bf16
+elapsed. This is a property of their reference's codegen on
+consumer Blackwell, not a property of our kernel.
 
-(Source: `docs/gpu.md:330-335`.) Cross-card numbers are for absolute
-reference only; the apples-to-apples claim is the same-column MFU
-table above.
-
-**A brief note on nunchaku's fp16 column:** their hand-PTX fp16 path
-hits 255 regs/thread + ~2.28 M LMEM spills + 101 % spill overhead;
-the bf16 path is 248 regs and zero spill. The 7-register difference
-is the register-cliff that explains the ~5 pp bf16-over-fp16 jump
-inside their column. We don't reproduce that asymmetry — our single
-`tcgen05` atom with `ab_dtype` substitution goes through the same
-MLIR lowering for both dtypes, so our fp16 ≈ bf16 (within ±0.1 pp
-on three of four shapes). This is a property of their reference's
-codegen, not a property of our kernel; it explains the shape of
-their column, not the location of ours.
+Reports: `log/ncu_v2_postLUfix_4352_3840_3072_R128.ncu-rep` (B200),
+`log/ncu_nunchaku_4352_3840_3072_R128_{fp16,bf16}.ncu-rep` (Verda
+RTX PRO 6000, sm_120a).
 
 ## 10. What's still on the table
 
