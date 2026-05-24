@@ -95,24 +95,61 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         torch.npu.synchronize()
         _step("  inputs on NPU OK")
 
-        _step("  calling torch.ops.svdquant.gemm_w4a4")
-        out = torch.ops.svdquant.gemm_w4a4(
+        _step("  calling torch.ops.svdquant.gemm_w4a4_debug (task #95: 双输出)")
+        out, lora_buf = torch.ops.svdquant.gemm_w4a4_debug(
             act_npu, wgt_npu, ascales_npu, wscales_npu,
             lora_act_in_npu, lora_up_npu,
         )
         _step("  op returned, syncing")
         torch.npu.synchronize()
         _step(f"  sync OK, out shape {tuple(out.shape)} dtype {out.dtype}")
+        _step(f"  lora_buf shape {tuple(lora_buf.shape)} dtype {lora_buf.dtype}")
         self.assertEqual(out.shape, (PHASE3B_M, PHASE3B_N))
         self.assertEqual(out.dtype, torch.float16)
+        self.assertEqual(lora_buf.shape, (PHASE3B_M, PHASE3B_N))
+        self.assertEqual(lora_buf.dtype, torch.float32)
 
         out_cpu = out.cpu()
+        lora_buf_cpu = lora_buf.cpu()
+
+        # --- diagnostic 1: cube LoRA-up pass in isolation ---
+        # Device端 LA 先 cast 到 fp16(host op binding line 98),所以 ref
+        # 也得先 round 一遍才公平。lora_up 已经是 fp16.
+        la_fp16_ref = lora_act_in.to(torch.float16).to(torch.float32)
+        lu_fp32_ref = lora_up.to(torch.float32)
+        ref_lora_buf = la_fp16_ref @ lu_fp32_ref.T  # [M, N] fp32
+
+        def _stats(t, name):
+            t_f = t.float()
+            return (
+                f"  {name}: any_nan={t_f.isnan().any().item()} "
+                f"any_inf={t_f.isinf().any().item()} "
+                f"min={t_f.min().item():.4g} max={t_f.max().item():.4g} "
+                f"mean={t_f.mean().item():.4g}"
+            )
+
+        _step(_stats(ref_lora_buf, "ref_lora_buf"))
+        _step(_stats(lora_buf_cpu, "lora_buf "))
+        lb_diff = (lora_buf_cpu - ref_lora_buf).abs()
+        _step(
+            f"  lora_buf vs ref: max_abs={lb_diff.max().item():.4g} "
+            f"mean_abs={lb_diff.mean().item():.4g} "
+            f"any_nan_in_diff={lb_diff.isnan().any().item()}"
+        )
+
+        # --- diagnostic 2: full output ---
+        _step(_stats(ref.float(),  "ref       "))
+        _step(_stats(out_cpu,      "out      "))
         diff = (out_cpu.float() - ref.float()).abs()
         _step(
-            f"  diff vs ref: max_abs={diff.max().item():.4f} "
-            f"mean_abs={diff.mean().item():.4f} "
-            f"any_nan={out_cpu.isnan().any().item()}"
+            f"  out vs ref: max_abs={diff.max().item():.4g} "
+            f"mean_abs={diff.mean().item():.4g} "
+            f"any_nan_in_out={out_cpu.isnan().any().item()}"
         )
+
+        # 判定指引(给 log 读者):
+        #   lora_buf 已 NaN → cube LoRA-up pass 坏 (PLAN.md 3b-6c)
+        #   lora_buf 干净, out NaN → vec TADD region 坏 (PLAN.md 3b-6d)
         torch.testing.assert_close(
             out_cpu, ref, rtol=5e-2, atol=5e-2,
             msg="phase 3b int4+lora output diverged from baseline ref",
