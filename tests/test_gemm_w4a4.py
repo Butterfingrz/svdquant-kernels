@@ -147,9 +147,23 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
             f"any_nan_in_out={out_cpu.isnan().any().item()}"
         )
 
+        # --- diagnostic 3 (task #105 bisect): is main path still healthy? ---
+        # Subtract the LoRA term from ref to get what main-only output would be.
+        # If kernel returns this within 3a's 0.001 (lora_buf=0 means TADD is a
+        # no-op so it shouldn't matter), main K-loop + drain + LoRA section
+        # epilogue is clean — only the cube LoRA pass is broken.
+        # If still 2.6, there's an end-of-K-loop pipeline hazard.
+        ref_no_lora = ref.float() - ref_lora_buf
+        _step(_stats(ref_no_lora, "ref_no_lora"))
+        no_lora_diff = (out_cpu.float() - ref_no_lora).abs()
+        _step(
+            f"  out vs ref_no_lora: max_abs={no_lora_diff.max().item():.4g} "
+            f"mean_abs={no_lora_diff.mean().item():.4g}"
+        )
+
         # 判定指引(给 log 读者):
-        #   lora_buf 已 NaN → cube LoRA-up pass 坏 (PLAN.md 3b-6c)
-        #   lora_buf 干净, out NaN → vec TADD region 坏 (PLAN.md 3b-6d)
+        #   out vs ref_no_lora ≈ 0.001  → main 正常, 只是 cube LoRA pass 写0 (#104)
+        #   out vs ref_no_lora 仍 ≈ 2.6 → main 也被 LoRA section 污染了 → end-of-K-loop hazard
         torch.testing.assert_close(
             out_cpu, ref, rtol=5e-2, atol=5e-2,
             msg="phase 3b int4+lora output diverged from baseline ref",
