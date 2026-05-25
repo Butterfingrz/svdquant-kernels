@@ -248,22 +248,18 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         // Drain trailing FIX→M gate.
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
-        // Task #107: with zero-operand LoRA, TMATMUL produced NaN even
-        // though cmatrixInitVal=true; static src reads of PTO TMATMUL +
-        // mad_s4 show identical init flags. Force full M-pipe + FIX-pipe
-        // settle before the dtype-switching int32→fp32 mad so L0C BUF0
-        // is in a known state when the fp32 mad's init writes through.
+        // 3b-6n PROBE2: gate the post-K-loop pipe_barriers and the
+        // wait_flag_dev(VEC_TILE_CONSUMED) drain to localize the cube
+        // LoRA "TSTORE doesn't land" symptom. If lora_buf changes from
+        // 99 → some other value with these gone, one of them was hanging.
+#if 0
         pipe_barrier(PIPE_M);
         pipe_barrier(PIPE_FIX);
 
-        // Drain trailing VEC_TILE_CONSUMED signals. Vec fires once per
-        // K-block (kNumKBlocks total); cube only consumed
-        // max(0, kNumKBlocks - kActualPreload) of them in the loop,
-        // leaving kActualPreload pending here. With kNumKBlocks=2 and
-        // kActualPreload=2, that's 2 drains — matches what vec sent.
         for (uint32_t i = 0; i < kActualPreload; ++i) {
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
+#endif
 
 #if 1  // 3b-6n: un-gate AIC LoRA pass for write-zero debug (vec K-loop fixed in 3b-6m)
         // ===== LoRA-up cube pass =====
