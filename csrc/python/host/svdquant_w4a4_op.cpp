@@ -35,10 +35,13 @@ constexpr int64_t kPhase3bR         = 32;        // LoRA rank
 constexpr int64_t kPhase3bBlockSize = 64;        // K-block / mad_s4 KS
 constexpr int64_t kPhase3bRingSlots = 6;         // cube/vec int32 hand-off ring depth
 
-// Shared implementation. `out_lora_buf` is an optional out-parameter:
-// when non-null, the fp32 LoRA-up hand-off buffer is written into the
-// pointed-to tensor and surfaced to Python via gemm_w4a4_debug. Used by
-// task #95 to isolate the cube LoRA-up pass from the vec TADD epilogue.
+// Shared implementation. `out_lora_buf` / `out_workspace` are optional
+// out-parameters: when non-null, the corresponding internal scratch buffer
+// is surfaced to Python via gemm_w4a4_debug. workspace[kb] holds the cube
+// K-loop's raw int32 mad accumulator for K-block kb (pre-scale, pre-sum),
+// which lets the test recompute "what vec _should_ have produced" on the
+// CPU side. Used by task #95 / #109 to isolate cube-K-loop vs vec
+// pipeline vs cube-LoRA defects.
 static at::Tensor
 run_gemm_w4a4_impl(const at::Tensor& act,
                    const at::Tensor& wgt,
@@ -46,7 +49,8 @@ run_gemm_w4a4_impl(const at::Tensor& act,
                    const at::Tensor& wscales,
                    const at::Tensor& lora_act_in,
                    const at::Tensor& lora_up,
-                   at::Tensor* out_lora_buf)
+                   at::Tensor* out_lora_buf,
+                   at::Tensor* out_workspace)
 {
     TORCH_CHECK(act.device().type() == kNpuDevice,
                 "act must be a NPU tensor (PrivateUse1)");
@@ -129,6 +133,9 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     if (out_lora_buf != nullptr) {
         *out_lora_buf = lora_buf;
     }
+    if (out_workspace != nullptr) {
+        *out_workspace = workspace;
+    }
     return out;
 }
 
@@ -141,10 +148,12 @@ run_gemm_w4a4(const at::Tensor& act,
               const at::Tensor& lora_up)
 {
     return run_gemm_w4a4_impl(act, wgt, ascales, wscales,
-                              lora_act_in, lora_up, /*out_lora_buf=*/nullptr);
+                              lora_act_in, lora_up,
+                              /*out_lora_buf=*/nullptr,
+                              /*out_workspace=*/nullptr);
 }
 
-std::tuple<at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
 run_gemm_w4a4_debug(const at::Tensor& act,
                     const at::Tensor& wgt,
                     const at::Tensor& ascales,
@@ -153,9 +162,11 @@ run_gemm_w4a4_debug(const at::Tensor& act,
                     const at::Tensor& lora_up)
 {
     at::Tensor lora_buf;
+    at::Tensor workspace;
     at::Tensor out = run_gemm_w4a4_impl(act, wgt, ascales, wscales,
-                                        lora_act_in, lora_up, &lora_buf);
-    return std::make_tuple(out, lora_buf);
+                                        lora_act_in, lora_up,
+                                        &lora_buf, &workspace);
+    return std::make_tuple(out, lora_buf, workspace);
 }
 
 }  // namespace svdquant_op
@@ -166,11 +177,13 @@ TORCH_LIBRARY_FRAGMENT(svdquant, m)
 {
     m.def("gemm_w4a4(Tensor act, Tensor wgt, Tensor ascales, Tensor wscales, "
           "Tensor lora_act_in, Tensor lora_up) -> Tensor");
-    // task #95: debug variant returns the fp32 cube→vec LoRA-up hand-off
-    // buffer alongside the final fp16 output so the test can decide
-    // whether NaN entered in the cube LoRA pass or the vec TADD epilogue.
+    // task #95 / #109: debug variant returns the int32 per-K-block ring
+    // workspace + fp32 LoRA-up hand-off buffer alongside the final fp16
+    // output, so the test can three-way-split between cube K-loop (raw
+    // int32 vs CPU-scale recompute), vec pipeline (out vs CPU-scale
+    // recompute), and cube LoRA (lora_buf vs LA@LU_T).
     m.def("gemm_w4a4_debug(Tensor act, Tensor wgt, Tensor ascales, Tensor wscales, "
-          "Tensor lora_act_in, Tensor lora_up) -> (Tensor, Tensor)");
+          "Tensor lora_act_in, Tensor lora_up) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(svdquant, PrivateUse1, m)

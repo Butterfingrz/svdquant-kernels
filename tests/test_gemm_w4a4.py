@@ -56,6 +56,30 @@ PHASE3B_M = 64
 PHASE3B_K = 128
 PHASE3B_N = 128
 PHASE3B_R = 32     # LoRA rank — must match kPhase3bR in svdquant_w4a4_op.cpp
+PHASE3B_K_BLOCK = 64   # per-K-block mad_s4 KS
+PHASE3B_K_BLOCKS = PHASE3B_K // PHASE3B_K_BLOCK   # = 2
+
+
+def _recompute_from_workspace(workspace_cpu, ascales_cpu, wscales_cpu):
+    """task #109 — CPU recompute of what vec _should_ produce.
+
+    workspace_cpu: [RING_SLOTS, M, N] int32, only slots [0:K_BLOCKS] valid.
+    ascales_cpu : [K_BLOCKS, M] fp16
+    wscales_cpu : [K_BLOCKS, N] fp16
+
+    Returns: [M, N] fp32 — per-K-block scale & sum, mirroring vec's
+    TCVT(int32→fp32) + TROWEXPANDMUL(ascales) + TCOLEXPANDMUL(wscales)
+    + TADD across K-blocks. If this matches ref_no_lora ≈ 0.001, cube
+    K-loop ring is clean and any divergence in `out` is from vec.
+    """
+    import torch
+    acc = torch.zeros(PHASE3B_M, PHASE3B_N, dtype=torch.float32)
+    for kb in range(PHASE3B_K_BLOCKS):
+        partial = workspace_cpu[kb].float()           # [M, N]
+        a = ascales_cpu[kb].float()                   # [M]
+        w = wscales_cpu[kb].float()                   # [N]
+        acc += partial * a[:, None] * w[None, :]
+    return acc
 
 
 class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
@@ -95,8 +119,8 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         torch.npu.synchronize()
         _step("  inputs on NPU OK")
 
-        _step("  calling torch.ops.svdquant.gemm_w4a4_debug (task #95: 双输出)")
-        out, lora_buf = torch.ops.svdquant.gemm_w4a4_debug(
+        _step("  calling torch.ops.svdquant.gemm_w4a4_debug (task #109: triple-out)")
+        out, lora_buf, workspace = torch.ops.svdquant.gemm_w4a4_debug(
             act_npu, wgt_npu, ascales_npu, wscales_npu,
             lora_act_in_npu, lora_up_npu,
         )
@@ -104,13 +128,18 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         torch.npu.synchronize()
         _step(f"  sync OK, out shape {tuple(out.shape)} dtype {out.dtype}")
         _step(f"  lora_buf shape {tuple(lora_buf.shape)} dtype {lora_buf.dtype}")
+        _step(f"  workspace shape {tuple(workspace.shape)} dtype {workspace.dtype}")
         self.assertEqual(out.shape, (PHASE3B_M, PHASE3B_N))
         self.assertEqual(out.dtype, torch.float16)
         self.assertEqual(lora_buf.shape, (PHASE3B_M, PHASE3B_N))
         self.assertEqual(lora_buf.dtype, torch.float32)
+        # workspace is [RING_SLOTS=6, M, N] int32; only slots [0:K_BLOCKS] hold valid data
+        self.assertEqual(workspace.shape[1:], (PHASE3B_M, PHASE3B_N))
+        self.assertEqual(workspace.dtype, torch.int32)
 
         out_cpu = out.cpu()
         lora_buf_cpu = lora_buf.cpu()
+        workspace_cpu = workspace.cpu()
 
         # --- diagnostic 1: cube LoRA-up pass in isolation ---
         # Device端 LA 先 cast 到 fp16(host op binding line 98),所以 ref
@@ -148,11 +177,6 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         )
 
         # --- diagnostic 3 (task #105 bisect): is main path still healthy? ---
-        # Subtract the LoRA term from ref to get what main-only output would be.
-        # If kernel returns this within 3a's 0.001 (lora_buf=0 means TADD is a
-        # no-op so it shouldn't matter), main K-loop + drain + LoRA section
-        # epilogue is clean — only the cube LoRA pass is broken.
-        # If still 2.6, there's an end-of-K-loop pipeline hazard.
         ref_no_lora = ref.float() - ref_lora_buf
         _step(_stats(ref_no_lora, "ref_no_lora"))
         no_lora_diff = (out_cpu.float() - ref_no_lora).abs()
@@ -161,9 +185,34 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
             f"mean_abs={no_lora_diff.mean().item():.4g}"
         )
 
-        # 判定指引(给 log 读者):
-        #   out vs ref_no_lora ≈ 0.001  → main 正常, 只是 cube LoRA pass 写0 (#104)
-        #   out vs ref_no_lora 仍 ≈ 2.6 → main 也被 LoRA section 污染了 → end-of-K-loop hazard
+        # --- diagnostic 4 (task #109 cube K-loop): CPU recompute from workspace ---
+        # workspace[kb] is cube's raw int32 mad accumulator for K-block kb.
+        # CPU-side: per-block fp32 cast → scale by ascales[kb]·wscales[kb] → sum-K.
+        # That's exactly what vec does in UB, just done in torch on CPU.
+        # If this matches ref_no_lora to 0.001, cube K-loop ring is clean.
+        # Then `out vs cpu_recompute` isolates the vec pipeline error.
+        cpu_recompute = _recompute_from_workspace(
+            workspace_cpu, ascales, wscales
+        )
+        _step(_stats(cpu_recompute, "cpu_recompute"))
+        cube_diff = (cpu_recompute - ref_no_lora).abs()
+        _step(
+            f"  cpu_recompute vs ref_no_lora (CUBE K-loop): "
+            f"max_abs={cube_diff.max().item():.4g} "
+            f"mean_abs={cube_diff.mean().item():.4g}"
+        )
+        vec_diff = (out_cpu.float() - cpu_recompute).abs()
+        _step(
+            f"  out vs cpu_recompute (VEC pipeline): "
+            f"max_abs={vec_diff.max().item():.4g} "
+            f"mean_abs={vec_diff.mean().item():.4g}"
+        )
+
+        # 判定指引:
+        #   cpu_recompute vs ref_no_lora ≈ 0.001 → cube K-loop OK
+        #   cpu_recompute vs ref_no_lora ≫ 0.001 → cube K-loop 写出 junk int32
+        #   out vs cpu_recompute ≈ 0.001 → vec pipeline OK
+        #   out vs cpu_recompute ≫ 0.001 → vec pipeline 污染(TCVT/TROW/TCOL/TADD)
         torch.testing.assert_close(
             out_cpu, ref, rtol=5e-2, atol=5e-2,
             msg="phase 3b int4+lora output diverged from baseline ref",
@@ -193,13 +242,14 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         )
         _step(f"  ref max_abs={ref.abs().max().item():.3f}")
 
-        out, lora_buf = torch.ops.svdquant.gemm_w4a4_debug(
+        out, lora_buf, workspace = torch.ops.svdquant.gemm_w4a4_debug(
             act.npu(), wgt.npu(), ascales.npu(), wscales.npu(),
             lora_act_in.npu(), lora_up.npu(),
         )
         torch.npu.synchronize()
         out_cpu = out.cpu()
         lb_cpu  = lora_buf.cpu()
+        ws_cpu  = workspace.cpu()
 
         def _stats(t, name):
             t_f = t.float()
@@ -212,9 +262,18 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         diff = (out_cpu.float() - ref.float()).abs()
         _step(f"  out vs ref(zero-lora): max_abs={diff.max().item():.4g} "
               f"mean_abs={diff.mean().item():.4g}")
-        # 判定:
-        #   max_abs ≤ 0.001 → AIV 干净, 2.6 来自 AIC 写出 junk (#104 重点)
-        #   max_abs ≈ 2.6  → AIV TADD/TCVT 本身坏, 跟 LoRA 数据无关
+
+        # task #109 — same 3-way split, on zero-LoRA inputs
+        cpu_recompute = _recompute_from_workspace(ws_cpu, ascales, wscales)
+        _step(_stats(cpu_recompute, "cpu_recompute"))
+        cube_diff = (cpu_recompute - ref.float()).abs()
+        _step(f"  cpu_recompute vs ref (CUBE K-loop, zero-lora): "
+              f"max_abs={cube_diff.max().item():.4g} "
+              f"mean_abs={cube_diff.mean().item():.4g}")
+        vec_diff = (out_cpu.float() - cpu_recompute).abs()
+        _step(f"  out vs cpu_recompute (VEC pipeline, zero-lora): "
+              f"max_abs={vec_diff.max().item():.4g} "
+              f"mean_abs={vec_diff.mean().item():.4g}")
         _step("test_phase3b_zero_lora: pass (diagnostic only, no assert)")
 
 
