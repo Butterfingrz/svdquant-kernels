@@ -110,15 +110,14 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     // Internal scratch: cube/vec int32 ring + fp32 LoRA-up hand-off.
     auto workspace = at::empty(
         {kPhase3bRingSlots, kPhase3bM, kPhase3bN}, i32_options);
-    // Task #111 sentinel: explicit at::empty + fill_ to guarantee NPU
-    // storage + NPU fill (at::full on PrivateUse1 may not dispatch the
-    // way we assume — lora_buf reading back 99 when we KNOW cube TSTORE
-    // from K-loop iter 1 to p->lora_buf has the same code path that
-    // writes workspace correctly hints data_ptr() and GM disagree).
-    auto lora_buf  = at::empty({kPhase3bM, kPhase3bN}, fp32_options);
-    lora_buf.fill_(99.0f);
-    TORCH_CHECK(lora_buf.device().type() == kNpuDevice,
-                "internal: lora_buf must remain on NPU after fill_");
+    // 3b-6n: drop the separate lora_buf NPU allocation. PyTorch's at::empty
+    // / at::full on PrivateUse1 produced GM that cube fixpipe could NOT
+    // write to (sentinel 99 preserved across all probes). Instead we reuse
+    // workspace[slot 2] as the cube→vec LoRA hand-off channel (K-loop only
+    // uses slots 0/1). Below, the launcher gets a NULL lora_buf pointer —
+    // device side no longer reads p->lora_buf for either cube TSTORE or
+    // vec TLOAD (both indirect through p->workspace + slot 2 offset).
+    void* lora_buf_ptr = nullptr;
     auto out = at::empty({kPhase3bM, kPhase3bN}, fp16_options);
 
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
@@ -130,12 +129,15 @@ run_gemm_w4a4_impl(const at::Tensor& act,
         la_fp16.data_ptr(),
         lu_T.data_ptr(),
         workspace.data_ptr(),
-        lora_buf.data_ptr(),
+        lora_buf_ptr,
         out.data_ptr(),
         static_cast<void*>(stream));
 
     if (out_lora_buf != nullptr) {
-        *out_lora_buf = lora_buf;
+        // 3b-6n: return workspace[slot 2] aliased as fp32 [M, N]. Cube
+        // TSTORE wrote LoRA mad result there; bit-cast is exact since
+        // int32 / fp32 are both 4 bytes per element.
+        *out_lora_buf = workspace.select(0, 2).view(at::kFloat);
     }
     if (out_workspace != nullptr) {
         *out_workspace = workspace;

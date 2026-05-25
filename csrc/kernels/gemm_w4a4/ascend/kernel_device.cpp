@@ -233,19 +233,6 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             GlobalRingSlot ringSlot(ws_gm + (uint64_t)slot * kBM * kBN);
             TSTORE(ringSlot, cAccTile);
 
-            // 3b-6n PROBE(A): in K-loop iter 1, also TSTORE cAccTile to
-            // lora_buf GM (reinterpret int32 bytes as fp32 via Python view).
-            // If lora_buf reads back as garbage fp32 (NOT 99.0f sentinel),
-            // the K-loop's TSTORE _can_ reach lora_buf GM — bug is location
-            // /timing of the LoRA-section TSTORE, not the GM address.
-            // If lora_buf still reads 99 → p->lora_buf isn't a writable GM
-            // (host packing bug or stale pointer).
-            if (kb == 1u) {
-                auto* lb_int = (__gm__ int32_t*)p->lora_buf;
-                GlobalRingSlot lbProbe(lb_int);
-                TSTORE(lbProbe, cAccTile);
-            }
-
             // Tell vec this K-block is consumable.
             ffts_cross_core_sync(PIPE_FIX, pto::getFFTSMsg(0x2, CUBE_TILE_READY));
 
@@ -261,34 +248,34 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         // Drain trailing FIX→M gate.
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
-        // 3b-6n PROBE2: gate the post-K-loop pipe_barriers and the
-        // wait_flag_dev(VEC_TILE_CONSUMED) drain to localize the cube
-        // LoRA "TSTORE doesn't land" symptom. If lora_buf changes from
-        // 99 → some other value with these gone, one of them was hanging.
-#if 0
+        // Settle M-pipe + FIX-pipe before fp32 LoRA mad: main K-loop wrote
+        // int32 to L0C, want a clean state for the fp32 mad.
         pipe_barrier(PIPE_M);
         pipe_barrier(PIPE_FIX);
 
+        // Drain trailing VEC_TILE_CONSUMED signals. Vec fires once per
+        // K-block (kNumKBlocks total); cube consumed (kNumKBlocks - kActualPreload)
+        // of them in the K-loop, leaving kActualPreload pending here.
         for (uint32_t i = 0; i < kActualPreload; ++i) {
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
-#endif
 
-#if 1  // 3b-6n: un-gate AIC LoRA pass for write-zero debug (vec K-loop fixed in 3b-6m)
         // ===== LoRA-up cube pass =====
-        // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → lora_buf [M, N].
-        // L1 layout: place LA + LU_T after the main A/B occupancy. Main A occupies
-        // [0, M*K_packed) = [0, 4 KB); main B occupies [4 KB, 4 KB + K_packed*N) =
-        // [4 KB, 12 KB). LoRA LA goes at 16 KB (aligned), LU_T at 20 KB.
+        // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → workspace[slot 2] [M, N].
+        // 3b-6n: writing into workspace ring slot 2 instead of a separate
+        // lora_buf GM. PyTorch's at::full / at::empty for a NEW fp32 NPU
+        // tensor produced GM that cube fixpipe could NOT reach (sentinel
+        // 99 preserved across PROBE / PROBE2 / PROBE(A) / PROBE(A2)),
+        // while p->workspace works reliably (K-loop slots 0/1 verified
+        // round-trip by cpu_recompute). Slot 2 is unused by K-loop
+        // (kNumKBlocks=2 only writes 0/1) and unused by vec (vec reads
+        // workspace[0:2] only), so we reuse it as the cube→vec LoRA
+        // hand-off channel. Sync still goes through LORA_BUF_READY.
         constexpr uint64_t kL1LAOffset  = 16u * 1024;
         constexpr uint64_t kL1LUTOffset = kL1LAOffset + (uint64_t)kBM * kR * sizeof(half);
 
         // Both tiles use ND2NZ (BLayout=ColMajor + SLayout=RowMajor) because
-        // the GM tensors for la_fp16 [M, R] and lu_T [R, N] are both row-major
-        // (Layout::ND). The DN2ZN path used by the main-GEMM B side requires a
-        // column-major-strided GM layout, which would force a host-side
-        // transpose of lora_up before it reaches this kernel — wasteful for a
-        // small rank-R hand-off.
+        // the GM tensors for la_fp16 [M, R] and lu_T [R, N] are both row-major.
         using TileMatLA  = pto::Tile<pto::TileType::Mat, half, kBM, kR,
                                       pto::BLayout::ColMajor, kBM, kR,
                                       pto::SLayout::RowMajor, 512>;
@@ -305,29 +292,53 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         using GlobalLUT = pto::GlobalTensor<half,
             pto::Shape<1, 1, 1, kR, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
+        // LoRA hand-off GM: alias workspace[slot 2] as fp32.
         using GlobalLoraBuf = pto::GlobalTensor<float,
             pto::Shape<1, 1, 1, kBM, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
 
-        // 3b-6n PROBE: keep only the L0C accumulator tile (used by TSTORE).
-        // laMatTile / lutMatTile / aLoraL0 / bLoraL0 elided.
+        TileMatLA   laMatTile;
+        TileMatLUT  lutMatTile;
         TileAccLora loraAccTile;
+        TASSIGN(laMatTile,   kL1LAOffset);
+        TASSIGN(lutMatTile,  kL1LUTOffset);
         TASSIGN(loraAccTile, 0u);  // L0C BUF0 (after main K-loop drain)
 
-        // 3b-6n PROBE: skip TLOAD/TEXTRACT/TMATMUL entirely. Only fire
-        // TSTORE from loraAccTile @ L0C BUF0 — main K-loop left int32
-        // residual there, fixpipe will bit-cast to fp32 (garbage values).
-        // If lora_buf changes from 99.0f sentinel to ANY other value
-        // → fixpipe→lora_buf GM path works, mad is the bug;
-        // if lora_buf stays 99 → control flow doesn't reach TSTORE.
-        (void)kL1LUTOffset; (void)kL1LAOffset;  // unused under probe
-        GlobalLoraBuf loraBufGm(p->lora_buf);
+        GlobalLA  laGlobal((__gm__ half*)p->la_fp16);
+        GlobalLUT lutGlobal((__gm__ half*)p->lu_T);
+
+        TLOAD(laMatTile, laGlobal);
+        TLOAD(lutMatTile, lutGlobal);
+
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+
+        LeftTileLora  aLoraL0;
+        RightTileLora bLoraL0;
+        TASSIGN(aLoraL0, 0u);  // L0A BUF0
+        TASSIGN(bLoraL0, 0u);  // L0B BUF0
+
+        TEXTRACT(aLoraL0, laMatTile,  0, 0);
+        TEXTRACT(bLoraL0, lutMatTile, 0, 0);
+
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
+
+        TMATMUL(loraAccTile, aLoraL0, bLoraL0);
+
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
+
+        // TSTORE into workspace[slot 2] aliased as fp32 (kBM*kBN fp32 = same
+        // 32 KB region as one int32 ring slot).
+        constexpr uint32_t kLoraRingSlot = 2;
+        auto* lora_slot_gm = (__gm__ float*)(ws_gm + (uint64_t)kLoraRingSlot * kBM * kBN);
+        GlobalLoraBuf loraBufGm(lora_slot_gm);
         TSTORE(loraBufGm, loraAccTile);
 
-        // Signal vec that lora_buf is consumable.
+        // Signal vec that workspace[slot 2] holds the fp32 LoRA result.
         ffts_cross_core_sync(PIPE_FIX,
                               pto::getFFTSMsg(0x2, LORA_BUF_READY));
-#endif  // 3b-6m: end gate of AIC LoRA pass
     }
 
     if ASCEND_IS_AIV {
@@ -578,12 +589,10 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
 
-#if 0  // 3b-6m: gate entire AIV LoRA epilogue (incl. wait_flag_dev) — 3a-equivalent vec path
-        // ===== LoRA-up residual: running += lora_buf[row_off:row_off+vecM, :] =====
-        // Reuse kPartialOff for the LoRA tile UB region — partial_i32/f32 is dead
-        // after the K-loop (last iter's TADD has finished into running). loraTile
-        // is also dead after the TADD below, so it cleanly aliases outF16's UB
-        // region for the final TCVT.
+        // ===== LoRA-up residual: running += workspace[slot 2][row_off:row_off+vecM, :] =====
+        // 3b-6n: source is workspace[slot 2] aliased as fp32 (cube wrote the
+        // LoRA mad result there). Reuse kPartialOff for the LoRA tile UB
+        // region — partial_i32/f32 is dead after the K-loop.
         using TileLoraF32 = pto::Tile<pto::TileType::Vec, float, kVecM, kBN,
                                       pto::BLayout::RowMajor, kVecM, kBN>;
         using GlobalLoraSlice = pto::GlobalTensor<float,
@@ -592,13 +601,13 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
 
         wait_flag_dev(LORA_BUF_READY);
 
-#if 0  // task #108: bypass TLOAD+TADD to test if vec epilogue is the corruptor
         TileLoraF32 loraTile;
         TASSIGN(loraTile, kPartialOff);
 
+        constexpr uint32_t kLoraRingSlot = 2;
         const uint64_t lora_off = (uint64_t)row_off * kBN;
-        auto* lora_buf_gm = (__gm__ float*)p->lora_buf;
-        GlobalLoraSlice loraGm(lora_buf_gm + lora_off);
+        auto* lora_slot_gm = (__gm__ float*)(ws_gm + (uint64_t)kLoraRingSlot * kBM * kBN);
+        GlobalLoraSlice loraGm(lora_slot_gm + lora_off);
         TLOAD(loraTile, loraGm);
 
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
@@ -607,8 +616,6 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TileRunningF32 runningForAdd;
         TASSIGN(runningForAdd, kRunningOff);
         pto::TADD(runningForAdd, runningForAdd, loraTile);
-#endif
-#endif  // 3b-6m: end gate of AIV LoRA epilogue
 
         // Final epilogue: f32 → fp16 then TSTORE the AIV's row band.
         TileRunningF32 runningFinal;
