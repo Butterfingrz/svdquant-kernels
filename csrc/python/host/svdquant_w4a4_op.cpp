@@ -110,11 +110,12 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     // Internal scratch: cube/vec int32 ring + fp32 LoRA-up hand-off.
     auto workspace = at::empty(
         {kPhase3bRingSlots, kPhase3bM, kPhase3bN}, i32_options);
-    // Task #95 diagnostic: zeros instead of empty. If the kernel never
-    // actually writes to lora_buf, Python's view will read zero (clean
-    // baseline) instead of whatever uninitialized GM bytes were there.
-    auto lora_buf  = at::zeros(
-        {kPhase3bM, kPhase3bN}, fp32_options);
+    // Task #111 sentinel: fill with 99.0f instead of 0. If cube TSTORE
+    // overwrites lora_buf, Python sees 0 (or computed value); if cube TSTORE
+    // misses, Python sees the 99.0f sentinel — disambiguates "mad produced 0"
+    // vs "TSTORE missed". Revert to at::zeros once #111 is resolved.
+    auto lora_buf  = at::full(
+        {kPhase3bM, kPhase3bN}, 99.0f, fp32_options);
     auto out = at::empty({kPhase3bM, kPhase3bN}, fp16_options);
 
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
