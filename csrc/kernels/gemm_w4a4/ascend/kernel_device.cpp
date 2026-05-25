@@ -265,7 +265,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
 
-#if 0  // 3b-6m: gate entire AIC LoRA pass to test if it perturbs vec K-loop
+#if 1  // 3b-6n: un-gate AIC LoRA pass for write-zero debug (vec K-loop fixed in 3b-6m)
         // ===== LoRA-up cube pass =====
         // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → lora_buf [M, N].
         // L1 layout: place LA + LU_T after the main A/B occupancy. Main A occupies
