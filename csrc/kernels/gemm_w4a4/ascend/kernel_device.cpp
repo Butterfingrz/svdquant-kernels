@@ -530,6 +530,11 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             pto::TCVT(ascaleF32, ascaleF16, pto::RoundMode::CAST_RINT);
             pto::TCVT(wscaleF32, wscaleF16, pto::RoundMode::CAST_RINT);
 
+            // 3b-6m: restore the V-pipe drain that was implicit in the 3a
+            // debug TSTOREs (bisect-3 forced V→MTE3→V around partF32). Without
+            // it, vec K-loop output is 2.578 off — see #110.
+            pipe_barrier(PIPE_V);
+
             // Expand ascaleF32 [1, vecM] RowMajor → ascaleBcast [vecM, 8]
             // RowMajor where row r = [s_r] × 8. PTO's TROWEXPAND internally
             // calls vbrcb on the [1, M] flat row (which is well-defined
@@ -554,6 +559,10 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
 
             // partF32[m,n] *= ascaleF32[m]  (via pre-broadcast ascaleBcast)
             pto::TROWEXPANDMUL(partF32, partF32, ascaleBcast);
+
+            // 3b-6m: restore bisect-4's implicit V→MTE3→V drain between
+            // TROWEXPANDMUL and TCOLEXPANDMUL (both rewrite partF32 in-place).
+            pipe_barrier(PIPE_V);
 
             // partF32[m,n] *= wscaleF32[n]
             pto::TCOLEXPANDMUL(partF32, partF32, wscaleF32);
