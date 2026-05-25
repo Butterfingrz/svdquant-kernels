@@ -110,12 +110,15 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     // Internal scratch: cube/vec int32 ring + fp32 LoRA-up hand-off.
     auto workspace = at::empty(
         {kPhase3bRingSlots, kPhase3bM, kPhase3bN}, i32_options);
-    // Task #111 sentinel: fill with 99.0f instead of 0. If cube TSTORE
-    // overwrites lora_buf, Python sees 0 (or computed value); if cube TSTORE
-    // misses, Python sees the 99.0f sentinel — disambiguates "mad produced 0"
-    // vs "TSTORE missed". Revert to at::zeros once #111 is resolved.
-    auto lora_buf  = at::full(
-        {kPhase3bM, kPhase3bN}, 99.0f, fp32_options);
+    // Task #111 sentinel: explicit at::empty + fill_ to guarantee NPU
+    // storage + NPU fill (at::full on PrivateUse1 may not dispatch the
+    // way we assume — lora_buf reading back 99 when we KNOW cube TSTORE
+    // from K-loop iter 1 to p->lora_buf has the same code path that
+    // writes workspace correctly hints data_ptr() and GM disagree).
+    auto lora_buf  = at::empty({kPhase3bM, kPhase3bN}, fp32_options);
+    lora_buf.fill_(99.0f);
+    TORCH_CHECK(lora_buf.device().type() == kNpuDevice,
+                "internal: lora_buf must remain on NPU after fill_");
     auto out = at::empty({kPhase3bM, kPhase3bN}, fp16_options);
 
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
