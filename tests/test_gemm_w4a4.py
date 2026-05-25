@@ -170,6 +170,53 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         )
         _step("test_phase3b_int4_lora_path: pass")
 
+    def test_phase3b_zero_lora(self):
+        """task #107 — feed lora_act_in=0, lora_up=0. AIC TMATMUL becomes
+        0@0=0 → lora_buf is true zero (no L2/DRAM divergence). If `out`
+        matches `ref_no_lora` ≈ 0.001, the 2.6 in test 1 came from AIC
+        writing junk that AIV picked up via L2. If still 2.6, the AIV
+        TADD/TCVT epilogue is corrupting main independently."""
+        _step("test_phase3b_zero_lora: enter")
+        if not torch.npu.is_available():
+            self.skipTest("Ascend NPU not available")
+
+        _step("  building INT4 inputs + zero LoRA")
+        act, wgt, ascales, wscales = make_int4_inputs(
+            PHASE3B_M, PHASE3B_K, PHASE3B_N
+        )
+        lora_act_in = torch.zeros(PHASE3B_M, PHASE3B_R)
+        lora_up     = torch.zeros(PHASE3B_N, PHASE3B_R, dtype=torch.float16)
+
+        # ref with zero LoRA == 3a baseline (lora term = 0)
+        ref, _, _ = gemm_w4a4_ref_int4(
+            act, wgt, ascales, wscales, lora_act_in, lora_up,
+        )
+        _step(f"  ref max_abs={ref.abs().max().item():.3f}")
+
+        out, lora_buf = torch.ops.svdquant.gemm_w4a4_debug(
+            act.npu(), wgt.npu(), ascales.npu(), wscales.npu(),
+            lora_act_in.npu(), lora_up.npu(),
+        )
+        torch.npu.synchronize()
+        out_cpu = out.cpu()
+        lb_cpu  = lora_buf.cpu()
+
+        def _stats(t, name):
+            t_f = t.float()
+            return (f"  {name}: any_nan={t_f.isnan().any().item()} "
+                    f"min={t_f.min().item():.4g} max={t_f.max().item():.4g} "
+                    f"mean={t_f.mean().item():.4g}")
+        _step(_stats(lb_cpu,  "lora_buf  "))
+        _step(_stats(ref.float(), "ref       "))
+        _step(_stats(out_cpu, "out       "))
+        diff = (out_cpu.float() - ref.float()).abs()
+        _step(f"  out vs ref(zero-lora): max_abs={diff.max().item():.4g} "
+              f"mean_abs={diff.mean().item():.4g}")
+        # 判定:
+        #   max_abs ≤ 0.001 → AIV 干净, 2.6 来自 AIC 写出 junk (#104 重点)
+        #   max_abs ≈ 2.6  → AIV TADD/TCVT 本身坏, 跟 LoRA 数据无关
+        _step("test_phase3b_zero_lora: pass (diagnostic only, no assert)")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
