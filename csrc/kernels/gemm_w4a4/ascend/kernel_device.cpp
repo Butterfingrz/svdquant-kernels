@@ -300,43 +300,18 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             pto::Shape<1, 1, 1, kBM, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
 
-        TileMatLA   laMatTile;
-        TileMatLUT  lutMatTile;
+        // 3b-6n PROBE: keep only the L0C accumulator tile (used by TSTORE).
+        // laMatTile / lutMatTile / aLoraL0 / bLoraL0 elided.
         TileAccLora loraAccTile;
-        TASSIGN(laMatTile,    kL1LAOffset);
-        TASSIGN(lutMatTile,   kL1LUTOffset);
-        // 3b-6n: revert 3b-6i's L0C 32K offset back to BUF0. Symptom was
-        // lora_buf=0 with offset=32K, suggesting TMATMUL wrote BUF0 (default)
-        // while TSTORE read from 32K (empty region). main K-loop drained
-        // via pipe_barrier(PIPE_M)+pipe_barrier(PIPE_FIX) above, so BUF0
-        // is safe to overwrite.
-        TASSIGN(loraAccTile, 0u);  // L0C BUF0 (after main drain)
+        TASSIGN(loraAccTile, 0u);  // L0C BUF0 (after main K-loop drain)
 
-        GlobalLA  laGlobal((__gm__ half*)p->la_fp16);
-        GlobalLUT lutGlobal((__gm__ half*)p->lu_T);
-
-        TLOAD(laMatTile, laGlobal);
-        TLOAD(lutMatTile, lutGlobal);
-
-        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
-        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
-
-        LeftTileLora  aLoraL0;
-        RightTileLora bLoraL0;
-        TASSIGN(aLoraL0, 0u);  // L0A BUF0
-        TASSIGN(bLoraL0, 0u);  // L0B BUF0
-
-        TEXTRACT(aLoraL0, laMatTile,  0, 0);
-        TEXTRACT(bLoraL0, lutMatTile, 0, 0);
-
-        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-
-        TMATMUL(loraAccTile, aLoraL0, bLoraL0);
-
-        set_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
-        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
-
+        // 3b-6n PROBE: skip TLOAD/TEXTRACT/TMATMUL entirely. Only fire
+        // TSTORE from loraAccTile @ L0C BUF0 — main K-loop left int32
+        // residual there, fixpipe will bit-cast to fp32 (garbage values).
+        // If lora_buf changes from 99.0f sentinel to ANY other value
+        // → fixpipe→lora_buf GM path works, mad is the bug;
+        // if lora_buf stays 99 → control flow doesn't reach TSTORE.
+        (void)kL1LUTOffset; (void)kL1LAOffset;  // unused under probe
         GlobalLoraBuf loraBufGm(p->lora_buf);
         TSTORE(loraBufGm, loraAccTile);
 
