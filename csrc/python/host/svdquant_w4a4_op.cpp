@@ -109,12 +109,16 @@ run_gemm_w4a4_impl(const at::Tensor& act,
 
     // Internal scratch: cube/vec int32 ring. Slot 2 is the fp32 LoRA-up
     // hand-off channel (cube fp32 mad result aliased over int32 slot 2 — same
-    // bytes; K-loop only writes slots 0/1 so slot 2 is free). See
-    // docs/gotchas/ascend.md "tensor.cpu() can return host's prior fill" —
-    // do NOT pre-fill workspace; the host write reaches HBM but cube's L2
-    // writes don't flush before Python's .cpu(), so a sentinel would make
-    // valid cube writes look "missing".
-    auto workspace = at::empty(
+    // bytes; K-loop only writes slots 0/1 so slot 2 is free).
+    //
+    // Use `at::zeros` (not `at::empty`) — explicit zero-init forces the NPU
+    // allocator to commit physical GM / establish L2 lines before the kernel.
+    // Empirically, at::empty leaves the slot 2 GM line "cold" in a way that
+    // cube fixpipe TSTORE doesn't reliably land where vec MTE2 reads from.
+    // Zero is also a clean visible "uninitialized" for Python (no sentinel
+    // illusion; see docs/gotchas/ascend.md "tensor.cpu() can return prior
+    // fill").
+    auto workspace = at::zeros(
         {kPhase3bRingSlots, kPhase3bM, kPhase3bN}, i32_options);
     // 3b-6n: drop the separate lora_buf NPU allocation. PyTorch's at::empty
     // / at::full on PrivateUse1 produced GM that cube fixpipe could NOT

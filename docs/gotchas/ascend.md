@@ -427,3 +427,15 @@ the line (or aclrtSynchronizeStream's path picks it up — empirical,
 either way `out` is reliable). The issue is specifically when
 *cube* writes a hand-off buffer and the test reads that buffer
 directly instead of through vec.
+
+Companion finding: **use `at::zeros` (not `at::empty`) for any GM
+that cube writes via fixpipe and vec reads back via MTE2**. With
+`at::empty`, the GM line for the LoRA hand-off slot reproducibly
+fails to land — out comes out without the LoRA contribution (off
+by `max_abs(lora_term)` from `ref`). Switching to `at::zeros`
+fixes it. PyTorch's NPU allocator appears to defer physical commit
+or skip L2 line establishment for `at::empty`, in a way that
+matters for cube fixpipe → vec MTE2 hand-offs but not for cube
+fixpipe → host `.cpu()` (which goes through a different read path
+and tolerates the deferred state). Cost is one extra D2H init —
+negligible vs. the LoRA bring-up cycles burnt diagnosing this.
