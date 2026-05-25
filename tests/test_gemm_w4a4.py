@@ -102,8 +102,14 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         g = torch.Generator().manual_seed(0xB0BA)
         lora_act_in = (torch.rand(PHASE3B_M, PHASE3B_R, generator=g) * 2 - 1) * 0.1
         lora_up = ((torch.rand(PHASE3B_N, PHASE3B_R, generator=g) * 2 - 1) * 0.1).to(torch.float16)
+        # 3c-1: per-channel affine. wcscales kept near 1.0 (+0.5 base, +0.5
+        # range) so it doesn't blow up dynamic range past fp16; bias small
+        # so it doesn't dominate the GEMM output.
+        wcscales = ((torch.rand(PHASE3B_N, generator=g) + 0.5)).to(torch.float16)
+        bias = ((torch.rand(PHASE3B_N, generator=g) * 2 - 1) * 0.1).to(torch.float16)
         ref, _, _ = gemm_w4a4_ref_int4(
             act, wgt, ascales, wscales, lora_act_in, lora_up,
+            bias=bias, wcscales=wcscales,
         )
         self.assertEqual(ref.shape, (PHASE3B_M, PHASE3B_N))
         self.assertEqual(ref.dtype, torch.float16)
@@ -116,6 +122,8 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         wscales_npu = wscales.npu()
         lora_act_in_npu = lora_act_in.npu()
         lora_up_npu = lora_up.npu()
+        bias_npu = bias.npu()
+        wcscales_npu = wcscales.npu()
         torch.npu.synchronize()
         _step("  inputs on NPU OK")
 
@@ -123,6 +131,7 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         out, lora_buf, workspace = torch.ops.svdquant.gemm_w4a4_debug(
             act_npu, wgt_npu, ascales_npu, wscales_npu,
             lora_act_in_npu, lora_up_npu,
+            bias_npu, wcscales_npu,
         )
         _step("  op returned, syncing")
         torch.npu.synchronize()
@@ -220,31 +229,34 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         _step("test_phase3b_int4_lora_path: pass")
 
     def test_phase3b_zero_lora(self):
-        """task #107 — feed lora_act_in=0, lora_up=0. AIC TMATMUL becomes
-        0@0=0 → lora_buf is true zero (no L2/DRAM divergence). If `out`
-        matches `ref_no_lora` ≈ 0.001, the 2.6 in test 1 came from AIC
-        writing junk that AIV picked up via L2. If still 2.6, the AIV
-        TADD/TCVT epilogue is corrupting main independently."""
+        """task #107 (kept as 3c-1 regression coverage) — zero LoRA, real
+        bias/wcscales. Validates the main K-loop + per-channel affine
+        still passes when the LoRA cube pass produces only zeros."""
         _step("test_phase3b_zero_lora: enter")
         if not torch.npu.is_available():
             self.skipTest("Ascend NPU not available")
 
-        _step("  building INT4 inputs + zero LoRA")
+        _step("  building INT4 inputs + zero LoRA + 3c-1 affine")
         act, wgt, ascales, wscales = make_int4_inputs(
             PHASE3B_M, PHASE3B_K, PHASE3B_N
         )
         lora_act_in = torch.zeros(PHASE3B_M, PHASE3B_R)
         lora_up     = torch.zeros(PHASE3B_N, PHASE3B_R, dtype=torch.float16)
+        g = torch.Generator().manual_seed(0xB0BA)
+        wcscales = ((torch.rand(PHASE3B_N, generator=g) + 0.5)).to(torch.float16)
+        bias = ((torch.rand(PHASE3B_N, generator=g) * 2 - 1) * 0.1).to(torch.float16)
 
-        # ref with zero LoRA == 3a baseline (lora term = 0)
+        # ref with zero LoRA + 3c-1 affine — exercises main K-loop, skips LoRA add.
         ref, _, _ = gemm_w4a4_ref_int4(
             act, wgt, ascales, wscales, lora_act_in, lora_up,
+            bias=bias, wcscales=wcscales,
         )
         _step(f"  ref max_abs={ref.abs().max().item():.3f}")
 
         out, lora_buf, workspace = torch.ops.svdquant.gemm_w4a4_debug(
             act.npu(), wgt.npu(), ascales.npu(), wscales.npu(),
             lora_act_in.npu(), lora_up.npu(),
+            bias.npu(), wcscales.npu(),
         )
         torch.npu.synchronize()
         out_cpu = out.cpu()

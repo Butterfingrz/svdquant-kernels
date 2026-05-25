@@ -95,6 +95,8 @@ struct DeviceParams {
     __gm__ half*    wscales;     // [K/64, N]             fp16 (K-block, N)
     __gm__ half*    la_fp16;     // [M, R]                fp16 (cast from fp32 host-side)
     __gm__ half*    lu_T;        // [R, N]                fp16 (transposed host-side)
+    __gm__ half*    bias;        // [N]                   fp16
+    __gm__ half*    wcscales;    // [N]                   fp16
     __gm__ int32_t* workspace;   // [kRingSlots, M, N]    int32 cube/vec ring
     __gm__ float*   lora_buf;    // [M, N]                fp32 LoRA-up hand-off
     __gm__ half*    out;         // [M, N]                fp16 final
@@ -261,16 +263,11 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         }
 
         // ===== LoRA-up cube pass =====
-        // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → workspace[slot 2] [M, N].
-        // 3b-6n: writing into workspace ring slot 2 instead of a separate
-        // lora_buf GM. PyTorch's at::full / at::empty for a NEW fp32 NPU
-        // tensor produced GM that cube fixpipe could NOT reach (sentinel
-        // 99 preserved across PROBE / PROBE2 / PROBE(A) / PROBE(A2)),
-        // while p->workspace works reliably (K-loop slots 0/1 verified
-        // round-trip by cpu_recompute). Slot 2 is unused by K-loop
-        // (kNumKBlocks=2 only writes 0/1) and unused by vec (vec reads
-        // workspace[0:2] only), so we reuse it as the cube→vec LoRA
-        // hand-off channel. Sync still goes through LORA_BUF_READY.
+        // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → lora_buf [M, N].
+        // Host must allocate lora_buf with at::zeros (NOT at::empty) — empty
+        // leaves the GM line cold and cube fixpipe TSTORE doesn't reliably
+        // land. See docs/gotchas/ascend.md "tensor.cpu() can return prior
+        // fill" for the symptom story.
         constexpr uint64_t kL1LAOffset  = 16u * 1024;
         constexpr uint64_t kL1LUTOffset = kL1LAOffset + (uint64_t)kBM * kR * sizeof(half);
 
@@ -292,7 +289,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         using GlobalLUT = pto::GlobalTensor<half,
             pto::Shape<1, 1, 1, kR, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
-        // LoRA hand-off GM: alias workspace[slot 2] as fp32.
+        // LoRA hand-off GM: separate fp32 [M, N] tensor (p->lora_buf).
         using GlobalLoraBuf = pto::GlobalTensor<float,
             pto::Shape<1, 1, 1, kBM, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
@@ -329,14 +326,11 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
 
-        // TSTORE into workspace[slot 2] aliased as fp32 (kBM*kBN fp32 = same
-        // 32 KB region as one int32 ring slot).
-        constexpr uint32_t kLoraRingSlot = 2;
-        auto* lora_slot_gm = (__gm__ float*)(ws_gm + (uint64_t)kLoraRingSlot * kBM * kBN);
-        GlobalLoraBuf loraBufGm(lora_slot_gm);
+        // TSTORE L0C fp32 accumulator → lora_buf [M, N] GM.
+        GlobalLoraBuf loraBufGm((__gm__ float*)p->lora_buf);
         TSTORE(loraBufGm, loraAccTile);
 
-        // Signal vec that workspace[slot 2] holds the fp32 LoRA result.
+        // Signal vec that lora_buf holds the fp32 LoRA result.
         ffts_cross_core_sync(PIPE_FIX,
                               pto::getFFTSMsg(0x2, LORA_BUF_READY));
     }
@@ -410,6 +404,15 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         constexpr uint32_t kAscaleBcastOff  = kAscaleF32Off + kVecM * 4;
         constexpr uint32_t kWscaleF16Off    = kAscaleBcastOff + kVecM * kBcastCols * 4;
         constexpr uint32_t kWscaleF32Off    = kWscaleF16Off + kBN * 2;
+        // 3c-1 per-channel affine (epilogue-only): wcscales × running + bias.
+        // Same [1, kBN] fp16/f32 Tile pattern as wscale; only used after the
+        // K-loop ends, so technically free to overlap kAscale*/kWscale* — but
+        // append cleanly here, total adds ~1.5 KB to UB which is well within
+        // mix-mode AIV's 184 KB cap.
+        constexpr uint32_t kWcscaleF16Off   = kWscaleF32Off  + kBN * 4;
+        constexpr uint32_t kWcscaleF32Off   = kWcscaleF16Off + kBN * 2;
+        constexpr uint32_t kBiasF16Off      = kWcscaleF32Off + kBN * 4;
+        constexpr uint32_t kBiasF32Off      = kBiasF16Off    + kBN * 2;
         constexpr uint32_t kOutF16Off       = kPartialOff;  // overlap with partial post-loop
 
         using TilePartialI32 = pto::Tile<pto::TileType::Vec, int32_t, kVecM, kBN,
@@ -589,10 +592,9 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
 
-        // ===== LoRA-up residual: running += workspace[slot 2][row_off:row_off+vecM, :] =====
-        // 3b-6n: source is workspace[slot 2] aliased as fp32 (cube wrote the
-        // LoRA mad result there). Reuse kPartialOff for the LoRA tile UB
-        // region — partial_i32/f32 is dead after the K-loop.
+        // ===== LoRA-up residual: running += lora_buf[row_off:row_off+vecM, :] =====
+        // Reuse kPartialOff for the LoRA tile UB region — partial_i32/f32 is
+        // dead after the K-loop.
         using TileLoraF32 = pto::Tile<pto::TileType::Vec, float, kVecM, kBN,
                                       pto::BLayout::RowMajor, kVecM, kBN>;
         using GlobalLoraSlice = pto::GlobalTensor<float,
@@ -604,10 +606,8 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TileLoraF32 loraTile;
         TASSIGN(loraTile, kPartialOff);
 
-        constexpr uint32_t kLoraRingSlot = 2;
         const uint64_t lora_off = (uint64_t)row_off * kBN;
-        auto* lora_slot_gm = (__gm__ float*)(ws_gm + (uint64_t)kLoraRingSlot * kBM * kBN);
-        GlobalLoraSlice loraGm(lora_slot_gm + lora_off);
+        GlobalLoraSlice loraGm((__gm__ float*)p->lora_buf + lora_off);
         TLOAD(loraTile, loraGm);
 
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
@@ -616,6 +616,42 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TileRunningF32 runningForAdd;
         TASSIGN(runningForAdd, kRunningOff);
         pto::TADD(runningForAdd, runningForAdd, loraTile);
+
+        // ===== 3c-1 per-channel affine: running = running·wcscales + bias =====
+        // Reuse Wscale fp16/f32 Tile shapes ([1, kBN]). wcscales and bias
+        // are tiny ([N] = kBN halfs each, ~256 B) and live in their own UB
+        // offsets appended after kWscaleF32Off. TCOLEXPANDMUL broadcasts
+        // [1, kBN] across vecM rows (same primitive used per-K-block for
+        // wscale); TCOLEXPANDADD is the additive twin.
+        //
+        // pipe_barrier(PIPE_V) around the COL-expand pair — same internal
+        // sub-pipe race observed in the K-loop (#110 fix). Cheap insurance,
+        // and the V-side is already idle waiting on MTE2.
+        TileWscaleF16 wcscaleF16;
+        TileWscaleF32 wcscaleF32;
+        TileWscaleF16 biasF16;
+        TileWscaleF32 biasF32;
+        TASSIGN(wcscaleF16, kWcscaleF16Off);
+        TASSIGN(wcscaleF32, kWcscaleF32Off);
+        TASSIGN(biasF16,    kBiasF16Off);
+        TASSIGN(biasF32,    kBiasF32Off);
+
+        GlobalWscaleRow wcscaleGm((__gm__ half*)p->wcscales);
+        GlobalWscaleRow biasGm   ((__gm__ half*)p->bias);
+        TLOAD(wcscaleF16, wcscaleGm);
+        TLOAD(biasF16,    biasGm);
+
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+
+        pto::TCVT(wcscaleF32, wcscaleF16, pto::RoundMode::CAST_RINT);
+        pto::TCVT(biasF32,    biasF16,    pto::RoundMode::CAST_RINT);
+        pipe_barrier(PIPE_V);
+
+        pto::TCOLEXPANDMUL(runningForAdd, runningForAdd, wcscaleF32);
+        pipe_barrier(PIPE_V);
+        pto::TCOLEXPANDADD(runningForAdd, runningForAdd, biasF32);
+        pipe_barrier(PIPE_V);
 
         // Final epilogue: f32 → fp16 then TSTORE the AIV's row band.
         TileRunningF32 runningFinal;

@@ -34,13 +34,12 @@
 //
 // Reference: `tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu:34-105`.
 //
-// Phase 3b signature: raw device pointers + opaque stream. The torch
+// Phase 3c-1 signature: raw device pointers + opaque stream. The torch
 // op extension (`csrc/python/host/svdquant_w4a4_op.cpp`) calls this
 // directly with `at::Tensor.storage().data()` pointers and the current
 // NPU stream from `c10_npu::getCurrentNPUStream`. Tile size is still
-// constexpr-baked into the device kernel (M=64, K=128, N=128, R=16,
-// one tile per launch); Phase 3c adds tile parameterization + bias /
-// wcscales / multi-tile.
+// constexpr-baked into the device kernel (M=64, K=128, N=128, R=32,
+// one tile per launch); 3c-2/3 add tile parameterization + multi-tile.
 //
 // LoRA-up residual is computed on cube in a separate pass after the
 // main K-loop drains, then added to running_f32 on vec before final
@@ -49,7 +48,7 @@
 
 namespace svdquant::ascend {
 
-// Phase 3b — INT4 main path + LoRA-up residual.
+// Phase 3c-1 — INT4 main path + LoRA-up residual + per-channel affine.
 //
 //   act:         [M, K/2]                uint8   2 signed INT4 / byte
 //   wgt:         [N, K/2]                uint8
@@ -57,6 +56,8 @@ namespace svdquant::ascend {
 //   wscales:     [K/64, N]               fp16    per-64-K-block wgt  scale
 //   lora_act_in: [M, R]                  fp32    = prev-op output, R ≤ 128
 //   lora_up:     [N, R]                  fp16
+//   bias:        [N]                     fp16    per-channel affine bias
+//   wcscales:    [N]                     fp16    per-channel post-LoRA scale
 //   workspace:   [kRingSlots, M, N]      int32   cube/vec hand-off ring
 //   lora_buf:    [M, N]                  fp32    LoRA-up cube → vec hand-off
 //   out:         [M, N]                  fp16    final dequantized output
@@ -70,6 +71,7 @@ namespace svdquant::ascend {
 void gemm_w4a4(void* act, void* wgt,
                void* ascales, void* wscales,
                void* lora_act_in, void* lora_up,
+               void* bias, void* wcscales,
                void* workspace, void* lora_buf, void* out,
                void* stream);
 

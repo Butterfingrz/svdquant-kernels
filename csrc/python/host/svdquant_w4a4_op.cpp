@@ -1,19 +1,23 @@
-// torch op binding for `svdquant::gemm_w4a4` — Phase 3b INT4 main + LoRA-up.
+// torch op binding for `svdquant::gemm_w4a4` — Phase 3c-1 INT4 main + LoRA-up + per-channel affine.
 //
 // Registers a single op into the `svdquant` namespace's PrivateUse1
 // (NPU) dispatch table:
 //
 //   torch.ops.svdquant.gemm_w4a4(
-//       act, wgt, ascales, wscales, lora_act_in, lora_up) -> Tensor
+//       act, wgt, ascales, wscales,
+//       lora_act_in, lora_up,
+//       bias, wcscales) -> Tensor
 //
 // Inputs are packed signed-INT4 activation + weight + matching per-
 // 64-K-block fp16 scales + fp32 LoRA-down output + fp16 LoRA-up
-// weight. Output is fp16 [M, N]. Cube/vec int32 ring and fp32 LoRA
-// hand-off buffer are allocated as internal workspace here and freed
-// after the launcher returns — not user-visible.
+// weight + fp16 per-channel bias + fp16 per-channel post-LoRA scale.
+// Output is fp16 [M, N]. Cube/vec int32 ring and fp32 LoRA hand-off
+// buffer are allocated as internal workspace here and freed after the
+// launcher returns — not user-visible.
 //
-// Phase 3c will append optional `bias / wcscales` Tensors; the binding
-// layer pattern stays the same, only the host launcher signature grows.
+// Phase 3c-2 will pull tile shape (kBM/kBN/kBKLogical/kR) out of
+// constexpr and into launcher params; this binding layer pattern stays
+// the same, only the host launcher signature grows.
 
 #include <ATen/ATen.h>
 #include <torch/library.h>
@@ -49,6 +53,8 @@ run_gemm_w4a4_impl(const at::Tensor& act,
                    const at::Tensor& wscales,
                    const at::Tensor& lora_act_in,
                    const at::Tensor& lora_up,
+                   const at::Tensor& bias,
+                   const at::Tensor& wcscales,
                    at::Tensor* out_lora_buf,
                    at::Tensor* out_workspace)
 {
@@ -64,16 +70,23 @@ run_gemm_w4a4_impl(const at::Tensor& act,
                 "lora_act_in must be a NPU tensor (PrivateUse1)");
     TORCH_CHECK(lora_up.device().type() == kNpuDevice,
                 "lora_up must be a NPU tensor (PrivateUse1)");
+    TORCH_CHECK(bias.device().type() == kNpuDevice,
+                "bias must be a NPU tensor (PrivateUse1)");
+    TORCH_CHECK(wcscales.device().type() == kNpuDevice,
+                "wcscales must be a NPU tensor (PrivateUse1)");
     TORCH_CHECK(act.scalar_type() == at::kByte, "act must be uint8 (packed INT4)");
     TORCH_CHECK(wgt.scalar_type() == at::kByte, "wgt must be uint8 (packed INT4)");
     TORCH_CHECK(ascales.scalar_type() == at::kHalf, "ascales must be float16");
     TORCH_CHECK(wscales.scalar_type() == at::kHalf, "wscales must be float16");
     TORCH_CHECK(lora_act_in.scalar_type() == at::kFloat, "lora_act_in must be float32");
     TORCH_CHECK(lora_up.scalar_type() == at::kHalf, "lora_up must be float16");
+    TORCH_CHECK(bias.scalar_type() == at::kHalf, "bias must be float16");
+    TORCH_CHECK(wcscales.scalar_type() == at::kHalf, "wcscales must be float16");
     TORCH_CHECK(act.dim() == 2 && wgt.dim() == 2
                 && ascales.dim() == 2 && wscales.dim() == 2
-                && lora_act_in.dim() == 2 && lora_up.dim() == 2,
-                "all tensors must be 2D");
+                && lora_act_in.dim() == 2 && lora_up.dim() == 2
+                && bias.dim() == 1 && wcscales.dim() == 1,
+                "all tensors must have expected rank (matmul tensors 2D, bias/wcscales 1D)");
 
     constexpr int64_t kK_packed = kPhase3bK / 2;
     constexpr int64_t kK_blocks = kPhase3bK / kPhase3bBlockSize;
@@ -89,12 +102,18 @@ run_gemm_w4a4_impl(const at::Tensor& act,
                 "lora_act_in shape must be [", kPhase3bM, ", ", kPhase3bR, "] (Phase 3b)");
     TORCH_CHECK(lora_up.size(0) == kPhase3bN && lora_up.size(1) == kPhase3bR,
                 "lora_up shape must be [", kPhase3bN, ", ", kPhase3bR, "] (Phase 3b)");
+    TORCH_CHECK(bias.size(0) == kPhase3bN,
+                "bias shape must be [", kPhase3bN, "] (Phase 3c-1)");
+    TORCH_CHECK(wcscales.size(0) == kPhase3bN,
+                "wcscales shape must be [", kPhase3bN, "] (Phase 3c-1)");
     TORCH_CHECK(act.is_contiguous() && wgt.is_contiguous(),
                 "act and wgt must be contiguous");
     TORCH_CHECK(ascales.is_contiguous() && wscales.is_contiguous(),
                 "ascales and wscales must be contiguous");
     TORCH_CHECK(lora_act_in.is_contiguous() && lora_up.is_contiguous(),
                 "lora_act_in and lora_up must be contiguous");
+    TORCH_CHECK(bias.is_contiguous() && wcscales.is_contiguous(),
+                "bias and wcscales must be contiguous");
 
     auto fp16_options = act.options().dtype(at::kHalf);
     auto fp32_options = act.options().dtype(at::kFloat);
@@ -107,27 +126,18 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     auto la_fp16 = lora_act_in.to(at::kHalf);
     auto lu_T = lora_up.t().contiguous();
 
-    // Internal scratch: cube/vec int32 ring. Slot 2 is the fp32 LoRA-up
-    // hand-off channel (cube fp32 mad result aliased over int32 slot 2 — same
-    // bytes; K-loop only writes slots 0/1 so slot 2 is free).
+    // Internal scratch: cube/vec int32 ring + fp32 LoRA-up hand-off.
     //
     // Use `at::zeros` (not `at::empty`) — explicit zero-init forces the NPU
     // allocator to commit physical GM / establish L2 lines before the kernel.
-    // Empirically, at::empty leaves the slot 2 GM line "cold" in a way that
-    // cube fixpipe TSTORE doesn't reliably land where vec MTE2 reads from.
-    // Zero is also a clean visible "uninitialized" for Python (no sentinel
+    // Empirically, at::empty leaves the GM line "cold" in a way that cube
+    // fixpipe TSTORE doesn't reliably land where vec MTE2 reads from. Zero
+    // is also a clean visible "uninitialized" for Python (no sentinel
     // illusion; see docs/gotchas/ascend.md "tensor.cpu() can return prior
     // fill").
     auto workspace = at::zeros(
         {kPhase3bRingSlots, kPhase3bM, kPhase3bN}, i32_options);
-    // 3b-6n: drop the separate lora_buf NPU allocation. PyTorch's at::empty
-    // / at::full on PrivateUse1 produced GM that cube fixpipe could NOT
-    // write to (sentinel 99 preserved across all probes). Instead we reuse
-    // workspace[slot 2] as the cube→vec LoRA hand-off channel (K-loop only
-    // uses slots 0/1). Below, the launcher gets a NULL lora_buf pointer —
-    // device side no longer reads p->lora_buf for either cube TSTORE or
-    // vec TLOAD (both indirect through p->workspace + slot 2 offset).
-    void* lora_buf_ptr = nullptr;
+    auto lora_buf = at::zeros({kPhase3bM, kPhase3bN}, fp32_options);
     auto out = at::empty({kPhase3bM, kPhase3bN}, fp16_options);
 
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
@@ -138,16 +148,15 @@ run_gemm_w4a4_impl(const at::Tensor& act,
         const_cast<void*>(wscales.storage().data()),
         la_fp16.data_ptr(),
         lu_T.data_ptr(),
+        const_cast<void*>(bias.storage().data()),
+        const_cast<void*>(wcscales.storage().data()),
         workspace.data_ptr(),
-        lora_buf_ptr,
+        lora_buf.data_ptr(),
         out.data_ptr(),
         static_cast<void*>(stream));
 
     if (out_lora_buf != nullptr) {
-        // 3b-6n: return workspace[slot 2] aliased as fp32 [M, N]. Cube
-        // TSTORE wrote LoRA mad result there; bit-cast is exact since
-        // int32 / fp32 are both 4 bytes per element.
-        *out_lora_buf = workspace.select(0, 2).view(at::kFloat);
+        *out_lora_buf = lora_buf;
     }
     if (out_workspace != nullptr) {
         *out_workspace = workspace;
@@ -161,10 +170,13 @@ run_gemm_w4a4(const at::Tensor& act,
               const at::Tensor& ascales,
               const at::Tensor& wscales,
               const at::Tensor& lora_act_in,
-              const at::Tensor& lora_up)
+              const at::Tensor& lora_up,
+              const at::Tensor& bias,
+              const at::Tensor& wcscales)
 {
     return run_gemm_w4a4_impl(act, wgt, ascales, wscales,
                               lora_act_in, lora_up,
+                              bias, wcscales,
                               /*out_lora_buf=*/nullptr,
                               /*out_workspace=*/nullptr);
 }
@@ -175,12 +187,15 @@ run_gemm_w4a4_debug(const at::Tensor& act,
                     const at::Tensor& ascales,
                     const at::Tensor& wscales,
                     const at::Tensor& lora_act_in,
-                    const at::Tensor& lora_up)
+                    const at::Tensor& lora_up,
+                    const at::Tensor& bias,
+                    const at::Tensor& wcscales)
 {
     at::Tensor lora_buf;
     at::Tensor workspace;
     at::Tensor out = run_gemm_w4a4_impl(act, wgt, ascales, wscales,
                                         lora_act_in, lora_up,
+                                        bias, wcscales,
                                         &lora_buf, &workspace);
     return std::make_tuple(out, lora_buf, workspace);
 }
@@ -192,14 +207,16 @@ namespace {
 TORCH_LIBRARY_FRAGMENT(svdquant, m)
 {
     m.def("gemm_w4a4(Tensor act, Tensor wgt, Tensor ascales, Tensor wscales, "
-          "Tensor lora_act_in, Tensor lora_up) -> Tensor");
+          "Tensor lora_act_in, Tensor lora_up, "
+          "Tensor bias, Tensor wcscales) -> Tensor");
     // task #95 / #109: debug variant returns the int32 per-K-block ring
     // workspace + fp32 LoRA-up hand-off buffer alongside the final fp16
     // output, so the test can three-way-split between cube K-loop (raw
     // int32 vs CPU-scale recompute), vec pipeline (out vs CPU-scale
     // recompute), and cube LoRA (lora_buf vs LA@LU_T).
     m.def("gemm_w4a4_debug(Tensor act, Tensor wgt, Tensor ascales, Tensor wscales, "
-          "Tensor lora_act_in, Tensor lora_up) -> (Tensor, Tensor, Tensor)");
+          "Tensor lora_act_in, Tensor lora_up, "
+          "Tensor bias, Tensor wcscales) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(svdquant, PrivateUse1, m)

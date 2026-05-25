@@ -1,13 +1,14 @@
 // Host launcher for the Ascend gemm_w4a4 pod.
 //
-// Phase 3b signature: 9 × device pointer + opaque stream — raw INT4
-// inputs + per-K-block fp16 scales + LoRA-up inputs + int32 cube/vec
-// hand-off ring + fp32 LoRA hand-off buffer + fp16 output. Caller (the
-// torch op wrapper) is responsible for allocating workspace, lora_buf,
-// and out from the NPU caching allocator before this call.
+// Phase 3c-1 signature: 11 × device pointer + opaque stream — raw INT4
+// inputs + per-K-block fp16 scales + LoRA-up inputs + per-channel bias
+// + per-channel post-LoRA scale + int32 cube/vec hand-off ring + fp32
+// LoRA hand-off buffer + fp16 output. Caller (the torch op wrapper) is
+// responsible for allocating workspace, lora_buf, and out from the NPU
+// caching allocator before this call.
 //
-// The launcher repacks all 9 device pointers into a single device-side
-// `DeviceParams` struct (72 B) and H2D-copies it to a small staging
+// The launcher repacks all 11 device pointers into a single device-side
+// `DeviceParams` struct (88 B) and H2D-copies it to a small staging
 // allocation, because the auto-gen `aclrtlaunch_*` wrapper takes a
 // single `GM_ADDR params_addr` (it doesn't expand variadic tensor
 // args).
@@ -27,7 +28,7 @@ namespace svdquant::ascend {
 namespace {
 
 // Mirrors the device-side `DeviceParams` in kernel_device.cpp by byte
-// layout: 9 × 8 B = 72 B device pointers in this order. Host and
+// layout: 11 × 8 B = 88 B device pointers in this order. Host and
 // device structs cannot share a header because the device file is
 // `[aicore]` and ccec rejects dereferencing `void* __gm__` as a typed
 // `__gm__ T*`. Keep the two field lists in sync.
@@ -38,6 +39,8 @@ struct DeviceParams {
     void* wscales;     // [K/64, N]               fp16
     void* lora_act_in; // [M, R]                  fp32
     void* lora_up;     // [N, R]                  fp16
+    void* bias;        // [N]                     fp16
+    void* wcscales;    // [N]                     fp16
     void* workspace;   // [kRingSlots, M, N]      int32 cube/vec ring
     void* lora_buf;    // [M, N]                  fp32 LoRA hand-off
     void* out;         // [M, N]                  fp16 final
@@ -48,12 +51,14 @@ struct DeviceParams {
 void gemm_w4a4(void* act, void* wgt,
                void* ascales, void* wscales,
                void* lora_act_in, void* lora_up,
+               void* bias, void* wcscales,
                void* workspace, void* lora_buf, void* out,
                void* stream) {
     auto raw_stream = static_cast<aclrtStream>(stream);
 
     DeviceParams dp{act, wgt, ascales, wscales,
                     lora_act_in, lora_up,
+                    bias, wcscales,
                     workspace, lora_buf, out};
 
     void* dev_params = nullptr;
