@@ -233,6 +233,19 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             GlobalRingSlot ringSlot(ws_gm + (uint64_t)slot * kBM * kBN);
             TSTORE(ringSlot, cAccTile);
 
+            // 3b-6n PROBE(A): in K-loop iter 1, also TSTORE cAccTile to
+            // lora_buf GM (reinterpret int32 bytes as fp32 via Python view).
+            // If lora_buf reads back as garbage fp32 (NOT 99.0f sentinel),
+            // the K-loop's TSTORE _can_ reach lora_buf GM — bug is location
+            // /timing of the LoRA-section TSTORE, not the GM address.
+            // If lora_buf still reads 99 → p->lora_buf isn't a writable GM
+            // (host packing bug or stale pointer).
+            if (kb == 1u) {
+                auto* lb_int = (__gm__ int32_t*)p->lora_buf;
+                GlobalRingSlot lbProbe(lb_int);
+                TSTORE(lbProbe, cAccTile);
+            }
+
             // Tell vec this K-block is consumable.
             ffts_cross_core_sync(PIPE_FIX, pto::getFFTSMsg(0x2, CUBE_TILE_READY));
 
