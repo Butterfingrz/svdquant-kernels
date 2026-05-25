@@ -107,9 +107,15 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     auto la_fp16 = lora_act_in.to(at::kHalf);
     auto lu_T = lora_up.t().contiguous();
 
-    // Internal scratch: cube/vec int32 ring + fp32 LoRA-up hand-off.
+    // Internal scratch: cube/vec int32 ring + (slot 2) fp32 LoRA-up hand-off.
+    // 3b-6n probe: fill workspace with a non-zero sentinel so unwritten slot 2
+    // is distinguishable from "cube wrote 0". Cube K-loop overwrites slots 0/1
+    // immediately; if slot 2 reads back as sentinel after the kernel, cube
+    // LoRA TSTORE didn't land (control flow / fixpipe state). If slot 2 has
+    // real fp32 values (after viewing as fp32), cube wrote.
     auto workspace = at::empty(
         {kPhase3bRingSlots, kPhase3bM, kPhase3bN}, i32_options);
+    workspace.fill_(0x42424242);  // bytes 0x42 = fp32 ≈ 4.85e16
     // 3b-6n: drop the separate lora_buf NPU allocation. PyTorch's at::empty
     // / at::full on PrivateUse1 produced GM that cube fixpipe could NOT
     // write to (sentinel 99 preserved across all probes). Instead we reuse
