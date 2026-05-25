@@ -361,3 +361,69 @@ Generalization: any UB region that is BOTH a `PIPE_MTE2` TLoad
 target AND a `PIPE_V` output target across loop iterations needs
 V→MTE2 sync. UB regions written by V only (running accumulator,
 scratch) don't.
+
+## Host / PyTorch: `tensor.cpu()` of a kernel-written tensor can return the host's *prior* fill, not the cube's fixpipe output
+
+Discovered Phase 3b 2026-05-25.
+
+L2 residency of cube↔vec hand-off (first gotcha in this file) has a
+host-side companion symptom. If you pre-fill a PyTorch NPU tensor on
+the host (e.g. `at::full(99.0f)` or `tensor.fill_(0x42424242)`) and
+then a cube kernel writes to the same GM via `TSTORE`, the kernel's
+output reaches L2 but **may not flush to HBM before `.cpu()` reads
+back**. The host `fill_` *did* land in HBM (the host-side allocator
+path writes through). Result: vec (reading L2) sees cube's real
+values and produces a correct downstream output; Python
+`tensor.cpu()` reads HBM and returns the *fill value*, making
+intermediate buffers look "untouched" even though they were
+overwritten.
+
+This produces a particularly nasty class of false-debug signals:
+
+- `out` tensor passes vs. `ref` to 0.001 — kernel is correct.
+- "intermediate" debug tensor read back via `.cpu()` shows the
+  pre-fill value (0, NaN, 99.0f, sentinel pattern), suggesting
+  "cube didn't write".
+- You spend cycles convinced cube TSTORE is broken when it's the
+  *measurement* that's broken.
+
+Concrete chain that triggered Phase 3b's #111 ladder:
+`at::full({M,N}, 99.0f, fp32_options)` → `lora_buf.data_ptr()` →
+cube `TSTORE(loraBufGm, loraAccTile)` writes correct values to L2 →
+vec `TLOAD` reads correct values from L2 → final `out` is correct →
+Python `lora_buf.cpu()` reads HBM → all 99.0f.
+
+Apply:
+
+- **Trust `out` (the final tensor that vec writes via its own
+  fixpipe-equivalent path).** That path goes through fixpipe + GM
+  + the consumer's read; correctness there means the whole chain
+  worked.
+- **Don't trust intermediate `cube→GM` buffers read via `.cpu()`.**
+  If you need to inspect them, either:
+  - Have *vec* read the buffer (via UB MTE2) and re-TSTORE it to a
+    designated "observation" GM region that you then read from
+    host. Vec's read pulls L2 into UB; the subsequent TSTORE
+    forces a write-through that lands in HBM and is `.cpu()`-
+    visible.
+  - Call `aclrtSynchronizeStream` + a deliberate device-side
+    cache-flush op (if available on your CANN version) before the
+    `.cpu()` D2H.
+- **Don't pre-fill a kernel-write target as a "sentinel" to detect
+  whether the kernel wrote.** The sentinel will appear preserved
+  whether or not the kernel actually wrote, because the host write
+  reached HBM and the kernel's write didn't.
+
+Diagnostic: if Python sees the pre-fill / pre-zero value AND the
+downstream computation that *consumes* that buffer matches the
+reference, the kernel's write is real; you're observing a stale
+HBM view. The "downstream consumer matches ref" signal is the
+authoritative one.
+
+Doesn't apply when: the GM region is read only by the host
+(e.g. final `out` produced by vec's TSTORE that the test reads).
+`out` going through `.cpu()` works because vec's TSTORE flushes
+the line (or aclrtSynchronizeStream's path picks it up — empirical,
+either way `out` is reliable). The issue is specifically when
+*cube* writes a hand-off buffer and the test reads that buffer
+directly instead of through vec.
