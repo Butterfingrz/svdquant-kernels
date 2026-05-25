@@ -265,6 +265,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
 
+#if 0  // 3b-6m: gate entire AIC LoRA pass to test if it perturbs vec K-loop
         // ===== LoRA-up cube pass =====
         // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → lora_buf [M, N].
         // L1 layout: place LA + LU_T after the main A/B occupancy. Main A occupies
@@ -343,6 +344,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         // Signal vec that lora_buf is consumable.
         ffts_cross_core_sync(PIPE_FIX,
                               pto::getFFTSMsg(0x2, LORA_BUF_READY));
+#endif  // 3b-6m: end gate of AIC LoRA pass
     }
 
     if ASCEND_IS_AIV {
@@ -584,6 +586,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
 
+#if 0  // 3b-6m: gate entire AIV LoRA epilogue (incl. wait_flag_dev) — 3a-equivalent vec path
         // ===== LoRA-up residual: running += lora_buf[row_off:row_off+vecM, :] =====
         // Reuse kPartialOff for the LoRA tile UB region — partial_i32/f32 is dead
         // after the K-loop (last iter's TADD has finished into running). loraTile
@@ -613,6 +616,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TASSIGN(runningForAdd, kRunningOff);
         pto::TADD(runningForAdd, runningForAdd, loraTile);
 #endif
+#endif  // 3b-6m: end gate of AIV LoRA epilogue
 
         // Final epilogue: f32 → fp16 then TSTORE the AIV's row band.
         TileRunningF32 runningFinal;
