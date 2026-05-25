@@ -305,13 +305,12 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TileAccLora loraAccTile;
         TASSIGN(laMatTile,    kL1LAOffset);
         TASSIGN(lutMatTile,   kL1LUTOffset);
-        // Use a FRESH L0C region (32 KB offset), not BUF0 — main K-loop
-        // wrote int32 to BUF0 and task #107's pipe_barrier patch didn't
-        // recover from NaN, so the leading theory is that L0C BUF0 carries
-        // an int32 dtype state that init=true on the fp32 mad doesn't
-        // reset. L0C on 910B is 256 KB; main only used 32 KB at BUF0;
-        // plenty of room for a fresh fp32 slot.
-        TASSIGN(loraAccTile, 32u * 1024u);  // L0C offset 32 KB (fresh slot)
+        // 3b-6n: revert 3b-6i's L0C 32K offset back to BUF0. Symptom was
+        // lora_buf=0 with offset=32K, suggesting TMATMUL wrote BUF0 (default)
+        // while TSTORE read from 32K (empty region). main K-loop drained
+        // via pipe_barrier(PIPE_M)+pipe_barrier(PIPE_FIX) above, so BUF0
+        // is safe to overwrite.
+        TASSIGN(loraAccTile, 0u);  // L0C BUF0 (after main drain)
 
         GlobalLA  laGlobal((__gm__ half*)p->la_fp16);
         GlobalLUT lutGlobal((__gm__ half*)p->lu_T);
