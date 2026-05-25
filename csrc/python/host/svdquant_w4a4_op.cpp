@@ -106,7 +106,10 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     // Internal scratch: cube/vec int32 ring + fp32 LoRA-up hand-off.
     auto workspace = at::empty(
         {kPhase3bRingSlots, kPhase3bM, kPhase3bN}, i32_options);
-    auto lora_buf  = at::empty(
+    // Task #95 diagnostic: zeros instead of empty. If the kernel never
+    // actually writes to lora_buf, Python's view will read zero (clean
+    // baseline) instead of whatever uninitialized GM bytes were there.
+    auto lora_buf  = at::zeros(
         {kPhase3bM, kPhase3bN}, fp32_options);
     auto out = at::empty({kPhase3bM, kPhase3bN}, fp16_options);
 
