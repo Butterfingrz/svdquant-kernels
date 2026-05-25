@@ -597,6 +597,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
 
         wait_flag_dev(LORA_BUF_READY);
 
+#if 0  // task #108: bypass TLOAD+TADD to test if vec epilogue is the corruptor
         TileLoraF32 loraTile;
         TASSIGN(loraTile, kPartialOff);
 
@@ -611,6 +612,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TileRunningF32 runningForAdd;
         TASSIGN(runningForAdd, kRunningOff);
         pto::TADD(runningForAdd, runningForAdd, loraTile);
+#endif
 
         // Final epilogue: f32 → fp16 then TSTORE the AIV's row band.
         TileRunningF32 runningFinal;
