@@ -102,13 +102,16 @@ struct DeviceParams {
     __gm__ half*    out;         // [M, N]                fp16 final
 };
 
-// Tile shape constants — pinned for 3a single-tile. Starting smaller
-// (matching Phase 2d's mock shape M=64 K=128 N=128) to localize a
-// runtime UB-OOB on AIV; once data path is correct, scale up to the
-// production target M=128 K=2048 N=256 in 3a-cont.
-constexpr uint32_t kBM         = 64;
-constexpr uint32_t kBN         = 128;
-constexpr uint32_t kBKLogical  = 128;
+// Tile shape constants — pinned for 3c-3 production single-tile.
+// kNumKBlocks=32 ⇒ cube K-loop iterates 32 times per launch, vec drains
+// 32 K-blocks through the kRingSlots=6 ring with steady-state back-
+// pressure on VEC_TILE_CONSUMED. UB budget at this shape: kPartialOff
+// + kRunningOff = 2 × kVecM × kBN × 4B = 128 KB (kVecM=64, kBN=256),
+// plus ~7 KB for ascale/wscale/wcscale/bias tiles ⇒ ~135 KB / 184 KB
+// mix-mode AIV cap.
+constexpr uint32_t kBM         = 128;
+constexpr uint32_t kBN         = 256;
+constexpr uint32_t kBKLogical  = 2048;
 constexpr uint32_t kBKPacked   = kBKLogical / 2;
 constexpr uint32_t kKSLogical  = 64;                   // mad_s4 K-block / scale block
 constexpr uint32_t kKSPacked   = kKSLogical / 2;       // 32 packed bytes

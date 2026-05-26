@@ -29,12 +29,12 @@ namespace svdquant_op {
 
 constexpr auto kNpuDevice = c10::DeviceType::PrivateUse1;
 
-// Phase 3b tile is hardcoded — must match
+// Phase 3c-3 production tile is hardcoded — must match
 // `csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp` constexpr block.
-// Tile-parameterization comes in Phase 3c.
-constexpr int64_t kPhase3bM         = 64;
-constexpr int64_t kPhase3bK         = 128;
-constexpr int64_t kPhase3bN         = 128;
+// Tile-parameterization (3c-2) was skipped; production single-shot bump.
+constexpr int64_t kPhase3bM         = 128;
+constexpr int64_t kPhase3bK         = 2048;
+constexpr int64_t kPhase3bN         = 256;
 constexpr int64_t kPhase3bR         = 32;        // LoRA rank
 constexpr int64_t kPhase3bBlockSize = 64;        // K-block / mad_s4 KS
 constexpr int64_t kPhase3bRingSlots = 6;         // cube/vec int32 hand-off ring depth

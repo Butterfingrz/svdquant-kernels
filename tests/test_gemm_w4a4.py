@@ -51,13 +51,13 @@ from baseline.kernels.gemm_w4a4.ref_int4 import (  # noqa: E402
 _step("  baseline ref_int4 loaded OK")
 
 
-# Phase 3b tile constants — must match svdquant_w4a4_op.cpp + kernel_device.cpp.
-PHASE3B_M = 64
-PHASE3B_K = 128
-PHASE3B_N = 128
+# Phase 3c-3 production tile constants — must match svdquant_w4a4_op.cpp + kernel_device.cpp.
+PHASE3B_M = 128
+PHASE3B_K = 2048
+PHASE3B_N = 256
 PHASE3B_R = 32     # LoRA rank — must match kPhase3bR in svdquant_w4a4_op.cpp
 PHASE3B_K_BLOCK = 64   # per-K-block mad_s4 KS
-PHASE3B_K_BLOCKS = PHASE3B_K // PHASE3B_K_BLOCK   # = 2
+PHASE3B_K_BLOCKS = PHASE3B_K // PHASE3B_K_BLOCK   # = 32
 
 
 def _recompute_from_workspace(workspace_cpu, ascales_cpu, wscales_cpu):
