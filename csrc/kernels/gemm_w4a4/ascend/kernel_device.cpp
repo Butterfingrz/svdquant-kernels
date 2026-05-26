@@ -400,6 +400,18 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
 
+        // 3c-7 debug probe (task #125): reset FPC register before LoRA pass.
+        // K-loop's last TStore_FP left FPC pointing at FBuffer Scaling tile
+        // (wscale_packed for K-block 31). LoRA's plain TSTORE auto-selects
+        // QuantMode=NoQuant via GetCastPreQuantMode<float,float>, which per
+        // PTO ISA spec should ignore FPC — but the initial 3c-7 NPU run
+        // (a20877f) returned lora_buf all-zeros, suggesting the hardware
+        // fixpipe touches FPC even with NoQuant in some corner case.
+        // Point FPC at a benign zero address before LoRA TSTORE to rule out
+        // FPC residue.
+        set_fpc(0);
+        pipe_barrier(PIPE_FIX);
+
         // ===== LoRA-up cube pass =====
         // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → lora_buf [M, N].
         // Host must allocate lora_buf with at::zeros (NOT at::empty) — empty
