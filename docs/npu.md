@@ -177,12 +177,20 @@ estimated 910B INT4 cube peak (~512 TOPS, conservative), that's 7.9 %
 device-side MFU and 1.3 % wall-clock MFU.
 
 The headline gap is **host overhead** (320 µs wall vs 57 µs kernel),
-*not* the cube kernel itself. Three optimization vectors, ranked by
+*not* the cube kernel itself. Optimization vectors, ranked by
 expected return:
 
-1. **Pre-allocated `dev_params` / stream-resident param buffer** —
-   removes `aclrtMalloc` + `aclrtMemcpy` per call. Lifts wall MFU
-   ~5×. Touches `kernel.cpp` host launcher only.
+1. **(Done — 3c-5) PTO-style variadic launch.** Mirrors
+   `pto-isa/demos/baseline/gemm_basic/.../utils.h` `INVOKE_PTO_KERNEL`:
+   kernel entry takes 11 GM_ADDR + 1 uint64_t variadic args, no
+   `DeviceParams` pack. Launcher dropped `aclrtMalloc(96 B,
+   HUGE_FIRST)` + `aclrtMemcpy(H2D)` + `aclrtSynchronizeStream` +
+   `aclrtFree` per call (≈ 260 µs/call gone). Stream comes from
+   `c10_npu::getCurrentNPUStream`; torch_npu handles lazy sync when
+   the output tensor is read. Touches `kernel.cpp` + the kernel entry
+   signature in `kernel_device.cpp` only (kernel body unchanged — the
+   variadic args are aliased into a stack-allocated `DeviceParams`
+   view so the `p->field` reads downstream still work).
 2. **L0C ping-pong (BUF0 / BUF1)** — overlaps MAC with FIX drain.
    Lifts MAC ratio 6.7 % → estimated ~30 %. Touches
    `kernel_device.cpp` cube path only.

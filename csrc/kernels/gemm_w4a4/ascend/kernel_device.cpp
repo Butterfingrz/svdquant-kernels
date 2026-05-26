@@ -91,8 +91,9 @@
 //      other buffer. Expected MAC ratio 6.7 % → ~30 %. Cube-side only.
 //   2. Per-2-K-block drain batching in vec UB — halves FIX freq but
 //      doubles UB scratch (already 135 / 184 KB used).
-//   3. Pre-allocated dev_params on host (kernel.cpp) — kills the
-//      260 µs/call launch overhead currently dominating wall clock.
+//   3. (Done — 3c-5) PTO-style variadic launch on host (kernel.cpp).
+//      Killed the 260 µs/call launch overhead by dropping the
+//      DeviceParams aclrtMalloc/Memcpy/Sync/Free staging dance.
 // ──────────────────────────────────────────────────────────────────────
 
 #include "kernel_operator.h"
@@ -116,10 +117,21 @@ enum GemmFftsFlag : uint16_t {
     LORA_BUF_READY       = 4,
 };
 
-// Mirrors host-side DeviceParams in kernel.cpp. ccec disallows casting
-// `void* __gm__` to a typed `__gm__ T*` inside aicore code, so we read
-// these typed pointers from a host-packed struct on entry. Field
-// order MUST match the host-side struct exactly.
+// Local stack-allocated typed view over the variadic GM_ADDR args at
+// entry. Pre-3c-5 this was packed into a 96 B `DeviceParams` struct on
+// host, H2D-copied to a freshly aclrtMalloc'd device staging slot per
+// call, then read here through a single GM_ADDR. Per-call malloc +
+// memcpy + sync + free added ~260 µs/call (msprof: 318 µs wall vs 57 µs
+// device — see 3c-4 perf snapshot above and docs/npu.md). PTO's
+// INVOKE_PTO_KERNEL (see pto-isa/demos/baseline/gemm_basic/.../utils.h)
+// just passes the variadic args through ACLRT_LAUNCH_KERNEL — no
+// packing. Mirroring that here.
+//
+// We still alias the variadic args into a typed struct because
+// (a) ccec disallows casting `void* __gm__` to a typed `__gm__ T*`
+// inline, so the typed casts have to happen once at entry and
+// (b) the rest of the kernel body still reads `p->act`, `p->wgt`, …
+// — only the entry path changes, not the data-flow downstream.
 struct DeviceParams {
     __gm__ uint8_t* act;         // [M_total, K/2]                  packed INT4
     __gm__ uint8_t* wgt;         // [N, K/2]                        packed INT4 (shared)
@@ -166,8 +178,26 @@ constexpr uint32_t kVecM      = kBM / kAivPerAic;      // 64 rows per AIV subblo
 }  // namespace
 
 extern "C" __global__ [aicore] void
-svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
-    auto* p = (__gm__ const DeviceParams*)params_addr;
+svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
+                          GM_ADDR ascales_in,     GM_ADDR wscales_in,
+                          GM_ADDR la_fp16_in,     GM_ADDR lu_T_in,
+                          GM_ADDR bias_in,        GM_ADDR wcscales_in,
+                          GM_ADDR workspace_in,   GM_ADDR lora_buf_in,
+                          GM_ADDR out_in,
+                          uint64_t m_total) {
+    // Build the typed view on the stack — no longer comes from a
+    // host-packed device staging buffer. Field order matches the
+    // call-site arg order in kernel.cpp (and 1-to-1 with the legacy
+    // DeviceParams layout, for review-friendliness).
+    DeviceParams dp{
+        (__gm__ uint8_t*)act_in,      (__gm__ uint8_t*)wgt_in,
+        (__gm__ half*)   ascales_in,  (__gm__ half*)   wscales_in,
+        (__gm__ half*)   la_fp16_in,  (__gm__ half*)   lu_T_in,
+        (__gm__ half*)   bias_in,     (__gm__ half*)   wcscales_in,
+        (__gm__ int32_t*)workspace_in,(__gm__ float*)  lora_buf_in,
+        (__gm__ half*)   out_in,
+        m_total};
+    const DeviceParams* p = &dp;
 
     if ASCEND_IS_AIC {
         // 3c-4 grid M-major: block_idx ∈ [0, blockDim) selects this core's

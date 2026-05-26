@@ -69,8 +69,11 @@ namespace svdquant::ascend {
 // Caller (the torch op wrapper) allocates `workspace`, `lora_buf`, and
 // `out`. Both `workspace` and `lora_buf` only persist for the duration
 // of the call — their contents are not user-visible. Synchronization
-// is the caller's responsibility; this launcher does the H2D pack of
-// the params struct + `aclrtlaunch_*` and returns.
+// is the caller's responsibility; this launcher just submits the
+// variadic-arg `aclrtlaunch_*` on the supplied stream and returns
+// (3c-5: no params staging, no blocking sync — caller passes
+// `c10_npu::getCurrentNPUStream`, torch_npu handles lazy sync when the
+// output is read; see PTO INVOKE_PTO_KERNEL pattern).
 void gemm_w4a4(void* act, void* wgt,
                void* ascales, void* wscales,
                void* lora_act_in, void* lora_up,
