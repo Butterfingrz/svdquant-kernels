@@ -86,6 +86,81 @@ instead of writing AscendC. One `kernel.py` saves having to maintain
 parallel CuTe DSL + AscendC implementations. Compute-bound ops and
 NPU-only ops still belong here.
 
+## Perf — `gemm_w4a4` on 910B3 (Phase 3c-4)
+
+Status: multi-tile launch validated (grid M-major,
+`blockDim = M_total / kTileM`); WebIDE 910B3 numerical pass
+`out vs ref max_abs ≈ 0.008` independent of `N_TILES`.
+
+### Wall-clock sweep (`tmp/bench_3c4_sweep.py`)
+
+Per-call wall (includes host launch overhead):
+
+| Tiles | M | µs/call | INT4 GOPS | scale vs ideal |
+|------:|---:|--------:|----------:|---------------:|
+| 1 | 128 | 308.93 | 434 | — |
+| 16 | 2048 | 318.46 | 6743 | **15.52× / 16×** |
+| 24 | 3072 | 388.75 | 8286 | 19.07× / 24× |
+
+Scaling 1→16 ≈ 97 % of ideal linear — cube cores actually parallel.
+Wall barely moves through 16 tiles ⇒ the ~310 µs base is **host
+overhead** (per-call `aclrtMalloc` + `aclrtMemcpy(88 B)` +
+`aclrtSynchronize` + Python dispatch), cube work itself is tens of µs.
+
+### `msprof --aic-metrics=PipeUtilization` at 16 tiles
+
+Device-side `Task Duration ≈ 57 µs/call` (vs 318 µs wall) — confirms
+host overhead is ~260 µs per launch. Cube pipe ratios (median over
+25 captured calls):
+
+| Pipe | Ratio | What |
+|------|------:|------|
+| **FIX (L0C → GM TSTORE)** | **49.6 %** | per-K-block int32 partial drain |
+| MAC (mad_s4) | 6.7 % | actual cube math |
+| MTE2 (GM → L1) | 5.3 % | TLOAD act/wgt |
+| MTE1 (L1 → L0A/B) | 4.4 % | TEXTRACT sub-tile |
+| (bubble) | ~34 % | mostly cube ↔ vec back-pressure |
+
+Vec pipe ratios: vec 62.1 %, scalar 18.9 %, MTE2 24.6 %, MTE3 0.5 %.
+Overall `cube_utilization` = 74.4 %.
+
+### Why FIX dominates (SVDQuant algorithm cost, not implementation bug)
+
+SVDQuant has per-64-K-block ascale/wscale, so the math forces dequant
+**inside** the K-loop. We mirror this with a 32-iter K-loop where each
+iter:
+
+1. cube `mad_s4` accumulates one K-block partial in L0C int32
+2. cube `TSTORE` drains [128, 256] int32 = 128 KB → workspace ring
+3. vec TLOADs the slot, applies ascale row + wscale col, accumulates
+4. cube reuses single-buf L0C for the next K-block
+
+The L0C single-buf forces MAC → FIX → MAC serialization per K-block;
+MAC can't overlap with FIX. 32 × 128 KB = 4 MB drained per tile.
+Regular dense GEMMs drain L0C once at the end — they can pin MAC near
+peak. Here we can't, because the per-K-block scales have to be
+applied between drains.
+
+Achieved cube INT4 = 2147 MFLOPs / 53.35 µs ≈ **40.2 TOPS** (kernel
+time), ≈ **6.8 TOPS** (wall time, what vLLM actually sees). Against an
+estimated 910B INT4 cube peak (~512 TOPS, conservative), that's 7.9 %
+device-side MFU and 1.3 % wall-clock MFU.
+
+The headline gap is **host overhead** (320 µs wall vs 57 µs kernel),
+*not* the cube kernel itself. Three optimization vectors, ranked by
+expected return:
+
+1. **Pre-allocated `dev_params` / stream-resident param buffer** —
+   removes `aclrtMalloc` + `aclrtMemcpy` per call. Lifts wall MFU
+   ~5×. Touches `kernel.cpp` host launcher only.
+2. **L0C ping-pong (BUF0 / BUF1)** — overlaps MAC with FIX drain.
+   Lifts MAC ratio 6.7 % → estimated ~30 %. Touches
+   `kernel_device.cpp` cube path only.
+3. **Batch 2 K-blocks per drain in vec UB** — halves drain frequency
+   but doubles UB scratch. Algorithm-compatible (vec applies the two
+   K-block scales separately after a fatter TLOAD). Last because UB
+   is already 135 / 184 KB used at production shape.
+
 ## Gotchas (Ascend / PTO ISA traps)
 
 Silent-misbehavior traps on the 910B (a2a3) cube + vec mix-mode
