@@ -48,6 +48,7 @@ _step("importing baseline.kernels.gemm_w4a4.ref_int4")
 from baseline.kernels.gemm_w4a4.ref_int4 import (  # noqa: E402
     gemm_w4a4_ref_int4, make_int4_inputs,
 )
+from baseline.kernels._int4 import pack_wscales_vdeqf16  # noqa: E402
 _step("  baseline ref_int4 loaded OK")
 
 
@@ -68,22 +69,26 @@ PHASE3B_K_BLOCKS = PHASE3B_K // PHASE3B_K_BLOCK   # = 32
 def _recompute_from_workspace(workspace_cpu, ascales_cpu, wscales_cpu):
     """task #109 — CPU recompute of what vec _should_ produce.
 
-    workspace_cpu: [RING_SLOTS, M, N] int32, only slots [0:K_BLOCKS] valid.
-    ascales_cpu : [K_BLOCKS, M] fp16
-    wscales_cpu : [K_BLOCKS, N] fp16
+    3c-7: workspace is now [RING_SLOTS, M, N] fp16, with × wscale already
+    folded by the cube FIX-pipe VDEQF16 path. So this mirror skips the
+    wscale multiply and only applies ascale + TADD. The wscales arg is
+    kept in the signature for API symmetry (legacy callers) but ignored.
 
-    Returns: [M, N] fp32 — per-K-block scale & sum, mirroring vec's
-    TCVT(int32→fp32) + TROWEXPANDMUL(ascales) + TCOLEXPANDMUL(wscales)
-    + TADD across K-blocks. If this matches ref_no_lora ≈ 0.001, cube
-    K-loop ring is clean and any divergence in `out` is from vec.
+    workspace_cpu: [RING_SLOTS, M, N] fp16, only slots [0:K_BLOCKS] valid.
+    ascales_cpu : [K_BLOCKS, M] fp16
+    wscales_cpu : [K_BLOCKS, N] fp16   (unused — already folded into workspace)
+
+    Returns: [M, N] fp32 — vec's TCVT(f16→fp32) + TROWEXPANDMUL(ascales)
+    + TADD across K-blocks. If this matches ref_no_lora to ~fp16 ULP,
+    cube K-loop ring + VDEQF16 fold is clean.
     """
     import torch
+    del wscales_cpu  # 3c-7: wscale is now applied on cube FIX-pipe.
     acc = torch.zeros(PHASE3B_M, PHASE3B_N, dtype=torch.float32)
     for kb in range(PHASE3B_K_BLOCKS):
-        partial = workspace_cpu[kb].float()           # [M, N]
+        partial = workspace_cpu[kb].float()           # [M, N], already × wscale
         a = ascales_cpu[kb].float()                   # [M]
-        w = wscales_cpu[kb].float()                   # [N]
-        acc += partial * a[:, None] * w[None, :]
+        acc += partial * a[:, None]
     return acc
 
 
@@ -121,10 +126,14 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         _step(f"  ref shape {tuple(ref.shape)} max_abs={ref.abs().max().item():.3f}")
 
         _step("  moving inputs to NPU")
+        # 3c-7: wscales packed to uint64 deqscalar (VDEQF16) on the host
+        # before move-to-NPU. Cube FIX-pipe consumes this layout directly;
+        # vec no longer touches wscales.
+        wscales_packed = pack_wscales_vdeqf16(wscales)
         act_npu = act.npu()
         wgt_npu = wgt.npu()
         ascales_npu = ascales.npu()
-        wscales_npu = wscales.npu()
+        wscales_npu = wscales_packed.npu()
         lora_act_in_npu = lora_act_in.npu()
         lora_up_npu = lora_up.npu()
         bias_npu = bias.npu()
@@ -261,8 +270,10 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         )
         _step(f"  ref max_abs={ref.abs().max().item():.3f}")
 
+        # 3c-7 VDEQF16 pre-pack.
+        wscales_packed = pack_wscales_vdeqf16(wscales)
         out, lora_buf, workspace = torch.ops.svdquant.gemm_w4a4_debug(
-            act.npu(), wgt.npu(), ascales.npu(), wscales.npu(),
+            act.npu(), wgt.npu(), ascales.npu(), wscales_packed.npu(),
             lora_act_in.npu(), lora_up.npu(),
             bias.npu(), wcscales.npu(),
         )

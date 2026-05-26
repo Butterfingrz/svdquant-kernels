@@ -26,7 +26,10 @@
 //   act          [M,   K/2]   uint8     2 signed INT4 / byte
 //   wgt          [N,   K/2]   uint8     2 signed INT4 / byte
 //   ascales      [K/64, M]    fp16      per-64-K-block act scale
-//   wscales      [K/64, N]    fp16      per-64-K-block weight scale
+//   wscales      [K/64, N]    uint64    per-64-K-block VDEQF16 packed
+//                                       deqscalar — fp16 mini-float at
+//                                       bits[32:13]; see
+//                                       baseline/_int4.pack_wscales_vdeqf16
 //   lora_act_in  [M,   R]     fp32      = fpsum @ lora_down from previous op
 //   lora_up      [N,   R]     fp16/bf16
 //   bias         [N]          fp16/bf16 (optional)
@@ -56,12 +59,14 @@ namespace svdquant::ascend {
 //   act:         [M, K/2]                uint8   2 signed INT4 / byte
 //   wgt:         [N, K/2]                uint8
 //   ascales:     [K/64, M]               fp16    per-64-K-block act scale
-//   wscales:     [K/64, N]               fp16    per-64-K-block wgt  scale
+//   wscales:     [K/64, N]               uint64  per-64-K-block VDEQF16
+//                                                packed deqscalar
 //   lora_act_in: [M, R]                  fp32    = prev-op output, R ≤ 128
 //   lora_up:     [N, R]                  fp16
 //   bias:        [N]                     fp16    per-channel affine bias
 //   wcscales:    [N]                     fp16    per-channel post-LoRA scale
-//   workspace:   [kRingSlots, M, N]      int32   cube/vec hand-off ring
+//   workspace:   [kRingSlots, M, N]      fp16    cube/vec hand-off ring
+//                                                (3c-7: post-VDEQF16 fp16)
 //   lora_buf:    [M, N]                  fp32    LoRA-up cube → vec hand-off
 //   out:         [M, N]                  fp16    final dequantized output
 //   stream:      aclrtStream cast to void*.

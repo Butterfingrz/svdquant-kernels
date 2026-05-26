@@ -139,18 +139,18 @@ enum GemmFftsFlag : uint16_t {
 // (b) the rest of the kernel body still reads `p->act`, `p->wgt`, …
 // — only the entry path changes, not the data-flow downstream.
 struct DeviceParams {
-    __gm__ uint8_t* act;         // [M_total, K/2]                  packed INT4
-    __gm__ uint8_t* wgt;         // [N, K/2]                        packed INT4 (shared)
-    __gm__ half*    ascales;     // [K/64, M_total]                 fp16
-    __gm__ half*    wscales;     // [K/64, N]                       fp16 (shared)
-    __gm__ half*    la_fp16;     // [M_total, R]                    fp16
-    __gm__ half*    lu_T;        // [R, N]                          fp16 (shared)
-    __gm__ half*    bias;        // [N]                             fp16 (shared)
-    __gm__ half*    wcscales;    // [N]                             fp16 (shared)
-    __gm__ int32_t* workspace;   // [blockDim, kRingSlots, kBM, N]  int32 cube/vec ring (per-block)
-    __gm__ float*   lora_buf;    // [M_total, N]                    fp32 LoRA-up hand-off
-    __gm__ half*    out;         // [M_total, N]                    fp16 final
-    uint64_t        m_total;     // total M rows = blockDim * kBM
+    __gm__ uint8_t*  act;         // [M_total, K/2]                  packed INT4
+    __gm__ uint8_t*  wgt;         // [N, K/2]                        packed INT4 (shared)
+    __gm__ half*     ascales;     // [K/64, M_total]                 fp16
+    __gm__ uint64_t* wscales;     // [K/64, N]                       VDEQF16 packed (3c-7)
+    __gm__ half*     la_fp16;     // [M_total, R]                    fp16
+    __gm__ half*     lu_T;        // [R, N]                          fp16 (shared)
+    __gm__ half*     bias;        // [N]                             fp16 (shared)
+    __gm__ half*     wcscales;    // [N]                             fp16 (shared)
+    __gm__ half*     workspace;   // [blockDim, kRingSlots, kBM, N]  fp16 cube/vec ring (3c-7)
+    __gm__ float*    lora_buf;    // [M_total, N]                    fp32 LoRA-up hand-off
+    __gm__ half*     out;         // [M_total, N]                    fp16 final
+    uint64_t         m_total;     // total M rows = blockDim * kBM
 };
 
 // Tile shape constants — pinned for 3c-3 production single-tile.
@@ -196,12 +196,12 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
     // call-site arg order in kernel.cpp (and 1-to-1 with the legacy
     // DeviceParams layout, for review-friendliness).
     DeviceParams dp{
-        (__gm__ uint8_t*)act_in,      (__gm__ uint8_t*)wgt_in,
-        (__gm__ half*)   ascales_in,  (__gm__ half*)   wscales_in,
-        (__gm__ half*)   la_fp16_in,  (__gm__ half*)   lu_T_in,
-        (__gm__ half*)   bias_in,     (__gm__ half*)   wcscales_in,
-        (__gm__ int32_t*)workspace_in,(__gm__ float*)  lora_buf_in,
-        (__gm__ half*)   out_in,
+        (__gm__ uint8_t*) act_in,      (__gm__ uint8_t*)wgt_in,
+        (__gm__ half*)    ascales_in,  (__gm__ uint64_t*)wscales_in,
+        (__gm__ half*)    la_fp16_in,  (__gm__ half*)    lu_T_in,
+        (__gm__ half*)    bias_in,     (__gm__ half*)    wcscales_in,
+        (__gm__ half*)    workspace_in,(__gm__ float*)   lora_buf_in,
+        (__gm__ half*)    out_in,
         m_total};
     const DeviceParams* p = &dp;
 
@@ -225,6 +225,19 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
                                     pto::SLayout::ColMajor, 512>;
         using TileAccC = pto::TileAcc<int32_t, kBM, kBN, kBM, kBN>;
 
+        // 3c-7 VDEQF16 wscale staging — per-K-block uint64 deqscalar vector
+        // staged GM → L1 (TileMat) → FBuffer (TileScaling), then consumed by
+        // TSTORE_FP during the L0C drain. Layout mirrors the PTO testcase
+        // `pto-isa/tests/.../tstore_acc2gm` (uint64 N-vector, NoneBox SLayout).
+        // FBuffer is 2 KB on A2/A3; one wscale vector (256 × 8 B = 2 KB)
+        // fills it exactly — no room for double-buffering.
+        using TileMatWscale  = pto::Tile<pto::TileType::Mat, uint64_t, 1, kBN,
+                                          pto::BLayout::RowMajor, 1, kBN,
+                                          pto::SLayout::NoneBox>;
+        using TileScalingWs  = pto::Tile<pto::TileType::Scaling, uint64_t,
+                                          1, kBN, pto::BLayout::RowMajor,
+                                          1, kBN, pto::SLayout::NoneBox>;
+
         using GlobalA  = pto::GlobalTensor<int8_t,
             pto::Shape<1, 1, 1, kBM, kBKPacked>,
             pto::Stride<1, 1, 1, kBKPacked, 1>>;
@@ -232,25 +245,42 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             pto::Shape<1, 1, 1, kBKPacked, kBN>,
             pto::Stride<1, 1, 1, 1, kBKPacked>,
             pto::Layout::DN>;
-        using GlobalRingSlot = pto::GlobalTensor<int32_t,
+        // 3c-7: ring slot dtype int32 → half. FIX-pipe VDEQF16 mode applies
+        // × wscale (per-N column) during the L0C drain and writes the
+        // already-dequantized fp16 partial to GM. Halves both ring slot
+        // bytes and vec's per-K-block MTE2 work.
+        using GlobalRingSlot = pto::GlobalTensor<half,
             pto::Shape<1, 1, 1, kBM, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
+        // wscale_packed[K/64, N] in GM, sliced to one [1, N] vector per
+        // K-block. uint64 per N column (VDEQF16 deqscalar — see
+        // baseline/_int4.pack_wscales_vdeqf16).
+        using GlobalWscalePacked = pto::GlobalTensor<uint64_t,
+            pto::Shape<1, 1, 1, 1, kBN>,
+            pto::Stride<1, 1, 1, kBN, 1>>;
 
-        // L1 layout: A at offset 0 (128 KB), B at offset 128 KB (256 KB).
-        // Total 384 KB / 512 KB.
-        constexpr uint64_t kL1AByteOffset = 0;
-        constexpr uint64_t kL1BByteOffset = (uint64_t)kBM * kBKPacked;
+        // L1 layout: A at offset 0 (128 KB), B at offset 128 KB (256 KB),
+        // wscale staging at 384 KB (1 × 256 × 8 = 2 KB). Total 386 KB / 512 KB.
+        constexpr uint64_t kL1AByteOffset       = 0;
+        constexpr uint64_t kL1BByteOffset       = (uint64_t)kBM * kBKPacked;
+        constexpr uint64_t kL1WscaleByteOffset  = kL1BByteOffset
+                                                + (uint64_t)kBKPacked * kBN;
+        // FBuffer Scaling tile lives at offset 0 (whole FBuffer, 2 KB on A2/A3).
+        constexpr uint64_t kFBufferWscaleOffset = 0;
 
-        TileMatA aMatTile;
-        TileMatB bMatTile;
-        TileAccC cAccTile;
-        TASSIGN(aMatTile, kL1AByteOffset);
-        TASSIGN(bMatTile, kL1BByteOffset);
-        // 3c-4 perf: L0C single-buf forces MAC ⇄ FIX serialization.
-        // msprof shows MAC 6.7 % / FIX 49.6 %. BUF0/BUF1 ping-pong is the
-        // single biggest cube-side win — see top-of-file perf snapshot
-        // and docs/npu.md § "Perf".
-        TASSIGN(cAccTile, 0u);  // L0C BUF0 (single buffer; see perf note above)
+        TileMatA       aMatTile;
+        TileMatB       bMatTile;
+        TileAccC       cAccTile;
+        TileMatWscale  wscaleMatTile;
+        TileScalingWs  wscaleScalingTile;
+        TASSIGN(aMatTile,          kL1AByteOffset);
+        TASSIGN(bMatTile,          kL1BByteOffset);
+        TASSIGN(wscaleMatTile,     kL1WscaleByteOffset);
+        TASSIGN(wscaleScalingTile, kFBufferWscaleOffset);
+        // L0C 128 KB on A2/A3 fits a single [kBM, kBN] int32 = 128 KB exactly
+        // (no room for ping-pong at this tile shape — see docs/gotchas/ascend.md
+        // "L0C is 128 KB on A2/A3").
+        TASSIGN(cAccTile, 0u);  // L0C BUF0
 
         GlobalA aGlobal((__gm__ int8_t*)act_gm);
         GlobalB bGlobal((__gm__ int8_t*)wgt_gm);
@@ -302,7 +332,13 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             TASSIGN(aMatTile, kL1A_base + (uint64_t)kb * kKSPacked * kBM);
             TASSIGN(bMatTile, kL1B_base + (uint64_t)kb * kKSPacked * kBN);
 
-            // Wait L0C is free (prev TSTORE drained on FIX pipe).
+            // 3c-7: load wscale_packed[kb, :N] from GM → L1 staging tile.
+            // Can overlap with mad_s4 (different pipes).
+            GlobalWscalePacked wscalePackedGm(
+                p->wscales + (uint64_t)kb * kBN);
+            TLOAD(wscaleMatTile, wscalePackedGm);
+
+            // Wait L0C is free (prev TSTORE_FP drained on FIX pipe).
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // Wait this ping-pong's L0A/B slot is free (prev mad_s4 drained).
             wait_flag(PIPE_M, PIPE_MTE1, (event_t)pingpong);
@@ -310,17 +346,32 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             pto::pto_macro_matmul_s4_block<kBM, kBN, kKSLogical>(
                 aMatTile, bMatTile, cAccTile, pingpong);
 
-            // Gate the FIX-pipe TSTORE on mad_s4 done.
+            // Gate the FIX-pipe drain on mad_s4 done.
             set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+
+            // Gate the L1→FBuffer copy on the MTE2 wscale load above
+            // (so the Scaling tile has this K-block's deqscalar before
+            // TSTORE_FP's pipe_barrier(PIPE_FIX) runs).
+            set_flag(PIPE_MTE2, PIPE_FIX, EVENT_ID2);
+
+            wait_flag(PIPE_MTE2, PIPE_FIX, EVENT_ID2);
+            // L1 (Mat, uint64) → FBuffer (Scaling). copy_cbuf_to_fbuf
+            // dispatches on PIPE_FIX (same queue as TSTORE_FP below), so
+            // the two are naturally serialized via TSTORE_FP's internal
+            // `set_fpc + pipe_barrier(PIPE_FIX)` and no explicit
+            // MTE1→FIX flag is needed — see the PTO testcase
+            // `tstore_acc2gm_kernel.cpp:445-451`.
+            TMOV(wscaleScalingTile, wscaleMatTile);
+
             wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
-            // Drain int32 partial to the ring slot. 3c-4 perf: this TSTORE
-            // is the FIX-pipe pipe-bound op — 128 KB / iter × 32 iter =
-            // 4 MB / tile, ratio 49.6 % of cube time (msprof). Can't batch
-            // K-blocks before drain because SVDQuant per-64-K ascale/wscale
-            // forces dequant inside the K-loop.
+            // FIX-pipe drain with VDEQF16 (auto-selected via
+            // GetVectorPreQuantMode<int32_t, half> from TileData / GlobalData
+            // dtypes — see pto-isa/.../a2a3/TStore.hpp:667). int32 L0C ×
+            // FBuffer-resident wscale[kb, :N] → fp16 ring slot.
+            // Drain bytes: 128 KB → 64 KB per K-block (half the int32 path).
             GlobalRingSlot ringSlot(ws_gm + (uint64_t)slot * kBM * kBN);
-            TSTORE(ringSlot, cAccTile);
+            TSTORE_FP(ringSlot, cAccTile, wscaleScalingTile);
 
             // Tell vec this K-block is consumable.
             ffts_cross_core_sync(PIPE_FIX, pto::getFFTSMsg(0x2, CUBE_TILE_READY));
@@ -459,7 +510,6 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
         auto* ws_gm   = p->workspace
                       + (uint64_t)block_idx * kRingSlots * kBM * kBN;
         auto* as_gm   = p->ascales;       // base; row stride is p->m_total
-        auto* wsl_gm  = p->wscales;       // shared
         auto* out_gm  = p->out + (uint64_t)block_idx * kBM * kBN;
         const uint64_t m_total_rows = p->m_total;
 
@@ -467,27 +517,33 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
         const uint32_t row_off    = kVecM * subblockid;  // 0 or 64
 
         // UB layout (per AIV subblock; TOTAL_VEC_LOCAL_SIZE = 184 KB on
-        // dav_c220 mix mode):
-        //   partial_i32 / partial_f32   shared @ 0           = vecM*BN*4 bytes
-        //   running_f32                 after partial        = vecM*BN*4 bytes
-        //   ascale_f16/_f32             small                after running
-        //   wscale_f16/_f32             small                after ascale
-        //   out_f16                     overlap @ 0          (post-loop, partial dead)
+        // dav_c220 mix mode). 3c-7: ring slot is fp16 (× wscale already
+        // folded by cube FIX-pipe VDEQF16), so vec drops the wscale tile
+        // and TCOLEXPANDMUL.
+        //   partial_f32                shared @ 0           = vecM*BN*4 = 64 KB
+        //                              (also LoRA tile post-loop, partial dead)
+        //   running_f32                64 KB                = 64 KB
+        //   partial_f16                128 KB               = vecM*BN*2 = 32 KB
+        //                              (also out_f16 post-loop, partial dead)
+        //   ascale_f16/_f32/_bcast     ~2.4 KB after that
+        //   wcscale_f16/_f32           ~1.5 KB
+        //   bias_f16/_f32              ~1.5 KB
+        //   ─────────────────────────────────────────
+        //   ≈ 165 KB / 184 KB cap, ~19 KB headroom.
         //
-        // partial_i32/f32 share offset 0 on purpose: tried disjoint at
-        // offset 0x4000 and triggered `VEC instruction error: ub address
-        // out of bounds` mid-K-block, identical signature to 3a-fix-3
-        // (commit 0334240) which suspected PTO internal scratch
-        // (TMP_UB_OFFSET) using a fixed low UB offset. In-place TCVT
-        // i32→f32 is safe at the kernel level (PIPE_V is element-wise);
-        // the overlap stays.
+        // partial_f16 → partial_f32 TCVT writes to a *different* offset
+        // (kPartialOff vs kPartialF16Off) — fp16 read followed by widened
+        // fp32 write can't safely alias the same start address (different
+        // element strides), so we keep them disjoint.
+        //
         // Block size for vbrcb broadcast (32-byte block / sizeof(fp32) = 8).
         // TROWEXPAND([1, M] RowMajor → [M, 8] RowMajor) requires dst::Cols
         // == elemPerBlock = 8 (see pto::TROWEXPAND_IMPL isBroadcast check).
         constexpr uint32_t kBcastCols = 8;
 
-        constexpr uint32_t kPartialOff      = 0;
-        constexpr uint32_t kRunningOff      = kPartialOff + kVecM * kBN * 4;
+        constexpr uint32_t kPartialOff       = 0;
+        constexpr uint32_t kRunningOff       = kPartialOff + kVecM * kBN * 4;
+        constexpr uint32_t kPartialF16Off    = kRunningOff + kVecM * kBN * 4;
         // ascale = per-row M scale. Loaded RowMajor [1, vecM] half (mirror
         // of wscale's known-working pattern), TCVT to RowMajor [1, vecM]
         // fp32, then expanded by pto::TROWEXPAND to RowMajor [vecM, 8]
@@ -498,23 +554,21 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
         // loads the head element; switching to this load-row + expand
         // pattern bypasses the bug entirely. See memory note
         // pto_colmajor_n1_tload_broken.md.)
-        constexpr uint32_t kAscaleF16Off    = kRunningOff + kVecM * kBN * 4;
+        constexpr uint32_t kAscaleF16Off    = kPartialF16Off + kVecM * kBN * 2;
         constexpr uint32_t kAscaleF32Off    = kAscaleF16Off + kVecM * 2;
         constexpr uint32_t kAscaleBcastOff  = kAscaleF32Off + kVecM * 4;
-        constexpr uint32_t kWscaleF16Off    = kAscaleBcastOff + kVecM * kBcastCols * 4;
-        constexpr uint32_t kWscaleF32Off    = kWscaleF16Off + kBN * 2;
         // 3c-1 per-channel affine (epilogue-only): wcscales × running + bias.
-        // Same [1, kBN] fp16/f32 Tile pattern as wscale; only used after the
-        // K-loop ends, so technically free to overlap kAscale*/kWscale* — but
-        // append cleanly here, total adds ~1.5 KB to UB which is well within
-        // mix-mode AIV's 184 KB cap.
-        constexpr uint32_t kWcscaleF16Off   = kWscaleF32Off  + kBN * 4;
+        // [1, kBN] fp16/f32 Tile pattern.
+        constexpr uint32_t kWcscaleF16Off   = kAscaleBcastOff + kVecM * kBcastCols * 4;
         constexpr uint32_t kWcscaleF32Off   = kWcscaleF16Off + kBN * 2;
         constexpr uint32_t kBiasF16Off      = kWcscaleF32Off + kBN * 4;
         constexpr uint32_t kBiasF32Off      = kBiasF16Off    + kBN * 2;
-        constexpr uint32_t kOutF16Off       = kPartialOff;  // overlap with partial post-loop
+        constexpr uint32_t kOutF16Off       = kPartialF16Off;  // overlap post-loop
 
-        using TilePartialI32 = pto::Tile<pto::TileType::Vec, int32_t, kVecM, kBN,
+        // 3c-7: ring slot dtype is fp16 (× wscale already applied by cube
+        // FIX-pipe VDEQF16). Vec loads fp16, casts to fp32, multiplies by
+        // ascale (per-row), accumulates. No wscale tile or TCOLEXPANDMUL.
+        using TilePartialF16 = pto::Tile<pto::TileType::Vec, half, kVecM, kBN,
                                           pto::BLayout::RowMajor, kVecM, kBN>;
         using TilePartialF32 = pto::Tile<pto::TileType::Vec, float, kVecM, kBN,
                                           pto::BLayout::RowMajor, kVecM, kBN>;
@@ -523,34 +577,33 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
         using TileOutF16     = pto::Tile<pto::TileType::Vec, half, kVecM, kBN,
                                           pto::BLayout::RowMajor, kVecM, kBN>;
 
-        // ascale RowMajor row tiles (mirror of wscale): 32 contiguous halfs
-        // → 32 contiguous fp32s after TCVT. Then TROWEXPAND broadcasts each
-        // scalar into a 32-byte block (= 8 fp32) along the row axis,
-        // producing the [vecM, 8] tile that TROWEXPANDMUL takes as RowMajor
-        // src1 (without invoking internal vbrcb).
+        // ascale RowMajor row tiles: 32 contiguous halfs → 32 contiguous
+        // fp32s after TCVT. Then TROWEXPAND broadcasts each scalar into a
+        // 32-byte block (= 8 fp32) along the row axis, producing the
+        // [vecM, 8] tile that TROWEXPANDMUL takes as RowMajor src1
+        // (without invoking internal vbrcb). See gotchas/ascend.md
+        // "ColMajor [N,1] TLOAD broken" for why we load as a row.
         using TileAscaleF16    = pto::Tile<pto::TileType::Vec, half,  1, kVecM,
                                             pto::BLayout::RowMajor, 1, kVecM>;
         using TileAscaleF32    = pto::Tile<pto::TileType::Vec, float, 1, kVecM,
                                             pto::BLayout::RowMajor, 1, kVecM>;
         using TileAscaleBcastF32 = pto::Tile<pto::TileType::Vec, float, kVecM, kBcastCols,
                                               pto::BLayout::RowMajor, kVecM, kBcastCols>;
-        // wscale = per-col N scale → RowMajor [1, BN] (TCOLEXPANDMUL src1).
-        using TileWscaleF16 = pto::Tile<pto::TileType::Vec, half, 1, kBN,
+        // [1, kBN] fp16/f32 — used for wcscale and bias epilogue tiles.
+        using TileColRowF16 = pto::Tile<pto::TileType::Vec, half, 1, kBN,
                                          pto::BLayout::RowMajor, 1, kBN>;
-        using TileWscaleF32 = pto::Tile<pto::TileType::Vec, float, 1, kBN,
+        using TileColRowF32 = pto::Tile<pto::TileType::Vec, float, 1, kBN,
                                          pto::BLayout::RowMajor, 1, kBN>;
 
-        using GlobalRingSlot = pto::GlobalTensor<int32_t,
+        // 3c-7: ring slot is now fp16, not int32.
+        using GlobalRingSlot = pto::GlobalTensor<half,
             pto::Shape<1, 1, 1, kVecM, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
-        // Standard RowMajor [1, vecM] half GM strip (same shape pattern as
-        // wscale's GlobalWscaleRow). The previous ColMajor [vecM, 1] +
-        // Layout::DN setup silently TLOAD'd only the head half — see the
-        // memory note pto_colmajor_n1_tload_broken.md.
         using GlobalAscaleRow = pto::GlobalTensor<half,
             pto::Shape<1, 1, 1, 1, kVecM>,
             pto::Stride<1, 1, 1, kVecM, 1>>;
-        using GlobalWscaleRow = pto::GlobalTensor<half,
+        // GM strip for [1, kBN] half (wcscale, bias loaders).
+        using GlobalColRow = pto::GlobalTensor<half,
             pto::Shape<1, 1, 1, 1, kBN>,
             pto::Stride<1, 1, 1, kBN, 1>>;
         using GlobalOutTile  = pto::GlobalTensor<half,
@@ -571,8 +624,8 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
 
         for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
             wait_flag_dev(CUBE_TILE_READY);
-            // Wait prior iter's PIPE_V (TROWEXPANDMUL/TCOLEXPANDMUL/TMOV)
-            // to drain before this iter's TLOAD overwrites partial UB.
+            // Wait prior iter's PIPE_V (TCVT/TROWEXPANDMUL/TADD) to drain
+            // before this iter's TLOAD overwrites partial UB.
             wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
             const uint32_t slot = kb % kRingSlots;
 
@@ -582,55 +635,46 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             //     (ws_gm already pre-offset to this block's ring base)
             //   ascales[kb, block_idx*kBM + row_off : block_idx*kBM + row_off + kVecM]
             //     — row stride is m_total_rows, not kBM (multi-block layout)
-            //   wscales[kb, :]                   (shared across blocks)
+            //   3c-7: wscale is no longer loaded by vec (cube FIX-pipe
+            //     folded × wscale into the drain via VDEQF16).
             //   out[row_off:row_off+kVecM, :]    (out_gm already pre-offset)
             const uint64_t partial_off =
                 (uint64_t)slot * kBM * kBN + (uint64_t)row_off * kBN;
             const uint64_t ascale_off  =
                 (uint64_t)kb * m_total_rows
                 + (uint64_t)block_idx * kBM + row_off;
-            const uint64_t wscale_off  = (uint64_t)kb * kBN;
-            const uint64_t out_off     = (uint64_t)row_off * kBN;
 
-            TilePartialI32      partI32;
+            TilePartialF16      partF16;
             TilePartialF32      partF32;
             TileRunningF32      running;
             TileAscaleF16       ascaleF16;
             TileAscaleF32       ascaleF32;
             TileAscaleBcastF32  ascaleBcast;
-            TileWscaleF16       wscaleF16;
-            TileWscaleF32       wscaleF32;
-            TASSIGN(partI32,     kPartialOff);
-            TASSIGN(partF32,     kPartialOff);  // in-place i32→f32 cast (see UB layout note above)
+            TASSIGN(partF16,     kPartialF16Off);
+            TASSIGN(partF32,     kPartialOff);
             TASSIGN(running,     kRunningOff);
             TASSIGN(ascaleF16,   kAscaleF16Off);
             TASSIGN(ascaleF32,   kAscaleF32Off);
             TASSIGN(ascaleBcast, kAscaleBcastOff);
-            TASSIGN(wscaleF16,   kWscaleF16Off);
-            TASSIGN(wscaleF32,   kWscaleF32Off);
 
-            // ws_gm is this block's ring base; p->ascales/wscales use the
-            // absolute row offsets computed above.
-            GlobalRingSlot  partGm  (ws_gm        + partial_off);
-            GlobalAscaleRow ascaleGm(p->ascales   + ascale_off);
-            GlobalWscaleRow wscaleGm(p->wscales   + wscale_off);
+            GlobalRingSlot  partGm  (ws_gm      + partial_off);
+            GlobalAscaleRow ascaleGm(p->ascales + ascale_off);
 
             // Wait running_f32 region is free (prev TSTORE on out
             // tile finished, except on the first iter where this
             // is the seed).
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 
-            TLOAD(partI32,   partGm);
+            TLOAD(partF16,   partGm);
             TLOAD(ascaleF16, ascaleGm);
-            TLOAD(wscaleF16, wscaleGm);
 
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-            // Cast i32 → f32, fp16 → f32.
-            pto::TCVT(partF32,   partI32,   pto::RoundMode::CAST_RINT);
+            // Cast f16 → f32 (partial slot already × wscale from cube FIX),
+            // f16 → f32 (ascale).
+            pto::TCVT(partF32,   partF16,   pto::RoundMode::CAST_RINT);
             pto::TCVT(ascaleF32, ascaleF16, pto::RoundMode::CAST_RINT);
-            pto::TCVT(wscaleF32, wscaleF16, pto::RoundMode::CAST_RINT);
 
             // 3b-6m: restore the V-pipe drain that was implicit in the 3a
             // debug TSTOREs (bisect-3 forced V→MTE3→V around partF32). Without
@@ -638,14 +682,8 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             pipe_barrier(PIPE_V);
 
             // Expand ascaleF32 [1, vecM] RowMajor → ascaleBcast [vecM, 8]
-            // RowMajor where row r = [s_r] × 8. PTO's TROWEXPAND internally
-            // calls vbrcb on the [1, M] flat row (which is well-defined
-            // because the row tile was loaded via the canonical RowMajor
-            // GM → RowMajor UB path). The resulting [vecM, 8] tile is then
-            // a valid RowMajor src1 for TROWEXPANDMUL: its assertion
-            // `RowMajor src1 && src1ValidCol == 32/sizeof(T) = 8` holds,
-            // and the RowMajor code path skips the internal vbrcb scratch
-            // entirely.
+            // RowMajor where row r = [s_r] × 8 (see RowMajor src1 rationale
+            // in the pre-3c-7 comment block above this loop).
             pto::TROWEXPAND(ascaleBcast, ascaleF32);
 
             // Defensive: TROWEXPAND's internal vbrcb may leave the mask
@@ -659,15 +697,8 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             set_mask_norm();
             set_vector_mask(-1, -1);
 
-            // partF32[m,n] *= ascaleF32[m]  (via pre-broadcast ascaleBcast)
+            // partF32[m,n] *= ascaleF32[m]  (× wscale already in the slot)
             pto::TROWEXPANDMUL(partF32, partF32, ascaleBcast);
-
-            // 3b-6m: restore bisect-4's implicit V→MTE3→V drain between
-            // TROWEXPANDMUL and TCOLEXPANDMUL (both rewrite partF32 in-place).
-            pipe_barrier(PIPE_V);
-
-            // partF32[m,n] *= wscaleF32[n]
-            pto::TCOLEXPANDMUL(partF32, partF32, wscaleF32);
 
             // Accumulate into running_f32. On kb==0 there's no
             // prior value, so initialize via TMOV; subsequent iters
@@ -735,17 +766,17 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
         // pipe_barrier(PIPE_V) around the COL-expand pair — same internal
         // sub-pipe race observed in the K-loop (#110 fix). Cheap insurance,
         // and the V-side is already idle waiting on MTE2.
-        TileWscaleF16 wcscaleF16;
-        TileWscaleF32 wcscaleF32;
-        TileWscaleF16 biasF16;
-        TileWscaleF32 biasF32;
+        TileColRowF16 wcscaleF16;
+        TileColRowF32 wcscaleF32;
+        TileColRowF16 biasF16;
+        TileColRowF32 biasF32;
         TASSIGN(wcscaleF16, kWcscaleF16Off);
         TASSIGN(wcscaleF32, kWcscaleF32Off);
         TASSIGN(biasF16,    kBiasF16Off);
         TASSIGN(biasF32,    kBiasF32Off);
 
-        GlobalWscaleRow wcscaleGm((__gm__ half*)p->wcscales);
-        GlobalWscaleRow biasGm   ((__gm__ half*)p->bias);
+        GlobalColRow wcscaleGm((__gm__ half*)p->wcscales);
+        GlobalColRow biasGm   ((__gm__ half*)p->bias);
         TLOAD(wcscaleF16, wcscaleGm);
         TLOAD(biasF16,    biasGm);
 

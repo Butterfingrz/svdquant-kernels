@@ -1,23 +1,25 @@
-// torch op binding for `svdquant::gemm_w4a4` — Phase 3c-1 INT4 main + LoRA-up + per-channel affine.
+// torch op binding for `svdquant::gemm_w4a4`.
 //
 // Registers a single op into the `svdquant` namespace's PrivateUse1
 // (NPU) dispatch table:
 //
 //   torch.ops.svdquant.gemm_w4a4(
-//       act, wgt, ascales, wscales,
+//       act, wgt, ascales, wscales_packed,
 //       lora_act_in, lora_up,
 //       bias, wcscales) -> Tensor
 //
 // Inputs are packed signed-INT4 activation + weight + matching per-
-// 64-K-block fp16 scales + fp32 LoRA-down output + fp16 LoRA-up
-// weight + fp16 per-channel bias + fp16 per-channel post-LoRA scale.
-// Output is fp16 [M, N]. Cube/vec int32 ring and fp32 LoRA hand-off
-// buffer are allocated as internal workspace here and freed after the
-// launcher returns — not user-visible.
+// 64-K-block fp16 ascales + per-64-K-block VDEQF16 packed wscales
+// (uint64; see `baseline/kernels/_int4.py::pack_wscales_vdeqf16` for the
+// 19-bit-mini-float bit layout the cube FIX-pipe consumes) + fp32 LoRA-
+// down output + fp16 LoRA-up weight + fp16 per-channel bias + fp16
+// per-channel post-LoRA scale. Output is fp16 [M, N].
 //
-// Phase 3c-2 will pull tile shape (kBM/kBN/kBKLogical/kR) out of
-// constexpr and into launcher params; this binding layer pattern stays
-// the same, only the host launcher signature grows.
+// 3c-7 changed the cube/vec hand-off ring from int32 to fp16 — the FIX-
+// pipe applies × wscale during the L0C drain (VDEQF16 quant mode), so
+// the ring slot is the already-dequantized fp16 partial. Vec drops the
+// TCOLEXPANDMUL(wscale) step entirely and only multiplies by ascale.
+// Workspace is allocated as fp16 here.
 
 #include <ATen/ATen.h>
 #include <torch/library.h>
@@ -79,7 +81,14 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     TORCH_CHECK(act.scalar_type() == at::kByte, "act must be uint8 (packed INT4)");
     TORCH_CHECK(wgt.scalar_type() == at::kByte, "wgt must be uint8 (packed INT4)");
     TORCH_CHECK(ascales.scalar_type() == at::kHalf, "ascales must be float16");
-    TORCH_CHECK(wscales.scalar_type() == at::kHalf, "wscales must be float16");
+    // wscales: VDEQF16 packed uint64 deqscalars. Each uint64 holds a
+    // 19-bit mini-float at bits[32:13] (fp16 source ⇒ lossless pack).
+    // See `baseline/kernels/_int4.py::pack_wscales_vdeqf16`. Accept
+    // at::kUInt64 (newer torch) or at::kLong (older — same bit layout,
+    // kernel reads it as `__gm__ uint64_t*` either way).
+    TORCH_CHECK(wscales.scalar_type() == at::kUInt64
+                || wscales.scalar_type() == at::kLong,
+                "wscales must be uint64 (or int64) — VDEQF16 packed");
     TORCH_CHECK(lora_act_in.scalar_type() == at::kFloat, "lora_act_in must be float32");
     TORCH_CHECK(lora_up.scalar_type() == at::kHalf, "lora_up must be float16");
     TORCH_CHECK(bias.scalar_type() == at::kHalf, "bias must be float16");
@@ -128,7 +137,6 @@ run_gemm_w4a4_impl(const at::Tensor& act,
 
     auto fp16_options = act.options().dtype(at::kHalf);
     auto fp32_options = act.options().dtype(at::kFloat);
-    auto i32_options  = act.options().dtype(at::kInt);
 
     // Device cube path consumes fp16 inputs for the LoRA-up mad and
     // expects lora_up indexed K-first ([R, N]). Cast / transpose
@@ -137,12 +145,15 @@ run_gemm_w4a4_impl(const at::Tensor& act,
     auto la_fp16 = lora_act_in.to(at::kHalf);
     auto lu_T = lora_up.t().contiguous();
 
-    // Internal scratch: per-block cube/vec int32 ring + fp32 LoRA-up
-    // hand-off (one slice per block). See docs/gotchas/ascend.md
-    // "tensor.cpu() can return prior fill" for why we use at::zeros
-    // (cube fixpipe TSTORE doesn't reliably land into cold GM lines).
+    // Internal scratch: per-block cube/vec **fp16** ring (3c-7: cube
+    // FIX-pipe drains L0C int32 → fp16 with × wscale folded via
+    // VDEQF16; ring slot is the already-dequantized fp16 partial) +
+    // fp32 LoRA-up hand-off (one slice per block). See
+    // docs/gotchas/ascend.md "tensor.cpu() can return prior fill" for
+    // why we use at::zeros (cube fixpipe TSTORE doesn't reliably land
+    // into cold GM lines).
     auto workspace = at::zeros(
-        {blockDim, kRingSlots, kTileM, kTileN}, i32_options);
+        {blockDim, kRingSlots, kTileM, kTileN}, fp16_options);
     auto lora_buf = at::zeros({M_total, kTileN}, fp32_options);
     auto out = at::empty({M_total, kTileN}, fp16_options);
 
