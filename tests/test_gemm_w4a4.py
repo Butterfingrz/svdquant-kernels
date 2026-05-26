@@ -195,29 +195,32 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         )
 
         # --- diagnostic 4 (task #109 cube K-loop): CPU recompute from workspace ---
-        # workspace[kb] is cube's raw int32 mad accumulator for K-block kb.
-        # CPU-side: per-block fp32 cast → scale by ascales[kb]·wscales[kb] → sum-K.
-        # That's exactly what vec does in UB, just done in torch on CPU.
-        # If this matches ref_no_lora to 0.001, cube K-loop ring is clean.
-        # Then `out vs cpu_recompute` isolates the vec pipeline error.
-        cpu_recompute = _recompute_from_workspace(
-            workspace_cpu, ascales, wscales
-        )
-        _step(_stats(cpu_recompute, "cpu_recompute"))
-        cube_diff = (cpu_recompute - ref_no_lora).abs()
-        _step(
-            f"  cpu_recompute vs ref_no_lora (CUBE K-loop): "
-            f"max_abs={cube_diff.max().item():.4g} "
-            f"mean_abs={cube_diff.mean().item():.4g}"
-        )
-        vec_diff = (out_cpu.float() - cpu_recompute).abs()
-        _step(
-            f"  out vs cpu_recompute (VEC pipeline): "
-            f"max_abs={vec_diff.max().item():.4g} "
-            f"mean_abs={vec_diff.mean().item():.4g}"
-        )
+        # Only valid when K_BLOCKS ≤ RING_SLOTS (no slot overwrites). At 3c-3
+        # production shape K_BLOCKS=32 > RING_SLOTS=6 so workspace[kb] for
+        # kb≥6 is already overwritten by later K-blocks; the recompute would
+        # see only the last 6 partials. Skip the diagnostic in that case.
+        RING_SLOTS = 6
+        if PHASE3B_K_BLOCKS <= RING_SLOTS:
+            cpu_recompute = _recompute_from_workspace(
+                workspace_cpu, ascales, wscales
+            )
+            _step(_stats(cpu_recompute, "cpu_recompute"))
+            cube_diff = (cpu_recompute - ref_no_lora).abs()
+            _step(
+                f"  cpu_recompute vs ref_no_lora (CUBE K-loop): "
+                f"max_abs={cube_diff.max().item():.4g} "
+                f"mean_abs={cube_diff.mean().item():.4g}"
+            )
+            vec_diff = (out_cpu.float() - cpu_recompute).abs()
+            _step(
+                f"  out vs cpu_recompute (VEC pipeline): "
+                f"max_abs={vec_diff.max().item():.4g} "
+                f"mean_abs={vec_diff.mean().item():.4g}"
+            )
+        else:
+            _step(f"  (skip cpu_recompute diagnostic: K_BLOCKS={PHASE3B_K_BLOCKS} > RING_SLOTS={RING_SLOTS})")
 
-        # 判定指引:
+        # 判定指引(K_BLOCKS ≤ RING_SLOTS 时):
         #   cpu_recompute vs ref_no_lora ≈ 0.001 → cube K-loop OK
         #   cpu_recompute vs ref_no_lora ≫ 0.001 → cube K-loop 写出 junk int32
         #   out vs cpu_recompute ≈ 0.001 → vec pipeline OK
@@ -275,17 +278,22 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         _step(f"  out vs ref(zero-lora): max_abs={diff.max().item():.4g} "
               f"mean_abs={diff.mean().item():.4g}")
 
-        # task #109 — same 3-way split, on zero-LoRA inputs
-        cpu_recompute = _recompute_from_workspace(ws_cpu, ascales, wscales)
-        _step(_stats(cpu_recompute, "cpu_recompute"))
-        cube_diff = (cpu_recompute - ref.float()).abs()
-        _step(f"  cpu_recompute vs ref (CUBE K-loop, zero-lora): "
-              f"max_abs={cube_diff.max().item():.4g} "
-              f"mean_abs={cube_diff.mean().item():.4g}")
-        vec_diff = (out_cpu.float() - cpu_recompute).abs()
-        _step(f"  out vs cpu_recompute (VEC pipeline, zero-lora): "
-              f"max_abs={vec_diff.max().item():.4g} "
-              f"mean_abs={vec_diff.mean().item():.4g}")
+        # task #109 — same 3-way split, on zero-LoRA inputs (only valid when
+        # K_BLOCKS ≤ RING_SLOTS=6; skip at production shape K_BLOCKS=32).
+        RING_SLOTS = 6
+        if PHASE3B_K_BLOCKS <= RING_SLOTS:
+            cpu_recompute = _recompute_from_workspace(ws_cpu, ascales, wscales)
+            _step(_stats(cpu_recompute, "cpu_recompute"))
+            cube_diff = (cpu_recompute - ref.float()).abs()
+            _step(f"  cpu_recompute vs ref (CUBE K-loop, zero-lora): "
+                  f"max_abs={cube_diff.max().item():.4g} "
+                  f"mean_abs={cube_diff.mean().item():.4g}")
+            vec_diff = (out_cpu.float() - cpu_recompute).abs()
+            _step(f"  out vs cpu_recompute (VEC pipeline, zero-lora): "
+                  f"max_abs={vec_diff.max().item():.4g} "
+                  f"mean_abs={vec_diff.mean().item():.4g}")
+        else:
+            _step(f"  (skip cpu_recompute diagnostic: K_BLOCKS={PHASE3B_K_BLOCKS} > RING_SLOTS={RING_SLOTS})")
         _step("test_phase3b_zero_lora: pass (diagnostic only, no assert)")
 
 
