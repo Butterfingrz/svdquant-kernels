@@ -15,10 +15,12 @@
 //   L0A / L0B (64 KB each):
 //     ping-pong sub-tiles for one K-block (sizes set in
 //     pto_macro_matmul_s4.hpp). 4 KB / 8 KB tiles → ample headroom.
-//   L0C (256 KB):
-//     single int32 [128, 256] = 128 KB at offset 0. No ping-pong —
-//     each K-block writes init=true and is drained to GM workspace
-//     before the next mad_s4 overwrites L0C.
+//   L0C (128 KB on A2/A3 — see docs/gotchas/ascend.md):
+//     single int32 [128, 256] = 128 KB at offset 0, fills L0C exactly.
+//     No room for ping-pong at this tile shape. Each K-block writes
+//     init=true and is drained to GM workspace before the next
+//     mad_s4 overwrites L0C. FIX-pipe reduction via drain batching
+//     (task #122 / 3c-7) does not need a second L0C buffer.
 //   GM workspace (caller-allocated):
 //     int32 [kRingSlots=6, 128, 256] cube/vec hand-off ring (768 KB).
 //   GM out (caller-allocated): fp16 [128, 256] = 64 KB final.
@@ -241,26 +243,14 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
 
         TileMatA aMatTile;
         TileMatB bMatTile;
-        // 3c-6 L0C ping-pong: two [128, 256] int32 bufs in L0C — BUF0 @ 0,
-        // BUF1 @ 128 KB. Total fills the 256 KB L0C exactly. mad_s4 writes
-        // init=true so no need to clear between K-blocks targeting the
-        // same buf. The LoRA-up pass later reuses L0C BUF0 (offset 0),
-        // but only AFTER the trailing wait_flag(PIPE_FIX, PIPE_M) pair
-        // drains both bufs, so no conflict.
-        //
-        // Why ping-pong instead of single-buf: cube K-loop's mad_s4 (PIPE_M)
-        // and L0C drain TSTORE (PIPE_FIX) used to serialize on the single
-        // L0C buf — `wait_flag(FIX, M)` at the top of each iter blocked
-        // mad on prior iter's drain. With BUF0/BUF1, iter k drains on one
-        // buf while iter k+1 mads on the other. msprof 3c-4 said MAC 6.7%
-        // / FIX 49.6% / bubble 34% — expect FIX to stay where it is
-        // (single hardware pipe, TSTOREs still serialize on it) but MAC
-        // hides inside FIX and some of the bubble disappears.
-        TileAccC cAccTile0, cAccTile1;
+        TileAccC cAccTile;
         TASSIGN(aMatTile, kL1AByteOffset);
         TASSIGN(bMatTile, kL1BByteOffset);
-        TASSIGN(cAccTile0, 0u);                                            // L0C BUF0 @ 0
-        TASSIGN(cAccTile1, (uint64_t)kBM * kBN * sizeof(int32_t));         // L0C BUF1 @ 128 KB
+        // 3c-4 perf: L0C single-buf forces MAC ⇄ FIX serialization.
+        // msprof shows MAC 6.7 % / FIX 49.6 %. BUF0/BUF1 ping-pong is the
+        // single biggest cube-side win — see top-of-file perf snapshot
+        // and docs/npu.md § "Perf".
+        TASSIGN(cAccTile, 0u);  // L0C BUF0 (single buffer; see perf note above)
 
         GlobalA aGlobal((__gm__ int8_t*)act_gm);
         GlobalB bGlobal((__gm__ int8_t*)wgt_gm);
@@ -280,16 +270,13 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
         const uint64_t kL1B_base = (uint64_t)bMatTile.data();
 
         // Seed cross-pipe flags.
-        // - PIPE_M → PIPE_MTE1 (×2 events for L0A/B ping-pong): so the
+        // - PIPE_M → PIPE_MTE1 (×2 events for L0 ping-pong): so the
         //   first wait_flag inside the loop is satisfied on iter 0.
-        // - PIPE_FIX → PIPE_M (×2 events for L0C BUF0/BUF1 ping-pong):
-        //   so the first mad_s4 may overwrite both bufs without waiting
-        //   on a non-existent prior TSTORE. Iter 0 hits buf_evt=0, iter 1
-        //   hits buf_evt=1, both seeded here.
+        // - PIPE_FIX → PIPE_M: so the first mad_s4 may overwrite L0C
+        //   without waiting on a non-existent prior TSTORE.
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);  // L0C BUF0 ready
-        set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);  // L0C BUF1 ready (3c-6 added)
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
         // When the K-block count is smaller than the ring depth, back-
         // pressure in the loop never triggers. The drain loop below
@@ -300,8 +287,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             (kPreloadNum < kNumKBlocks) ? kPreloadNum : kNumKBlocks;
 
         for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
-            const uint64_t pingpong = kb & 1;             // L0A/L0B
-            const event_t  buf_evt  = (event_t)(kb & 1);  // L0C BUF (3c-6)
+            const uint64_t pingpong = kb & 1;
             const uint32_t slot     = kb % kRingSlots;
 
             // Back-pressure: after the ring's filled once, vec must
@@ -316,50 +302,40 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             TASSIGN(aMatTile, kL1A_base + (uint64_t)kb * kKSPacked * kBM);
             TASSIGN(bMatTile, kL1B_base + (uint64_t)kb * kKSPacked * kBN);
 
-            // Wait THIS BUF's L0C is free (prev TSTORE targeting this buf
-            // drained on FIX pipe). The OTHER buf's TSTORE may still be
-            // in flight on FIX — that's the win.
-            wait_flag(PIPE_FIX, PIPE_M, buf_evt);
+            // Wait L0C is free (prev TSTORE drained on FIX pipe).
+            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // Wait this ping-pong's L0A/B slot is free (prev mad_s4 drained).
             wait_flag(PIPE_M, PIPE_MTE1, (event_t)pingpong);
 
-            // Pick the L0C buf based on kb parity. mad_s4 inside the macro
-            // sets cmatrixInitVal=true (overwrite), so the buf needs no
-            // clear between iters that target it.
-            TileAccC& cTile = (kb & 1) ? cAccTile1 : cAccTile0;
             pto::pto_macro_matmul_s4_block<kBM, kBN, kKSLogical>(
-                aMatTile, bMatTile, cTile, pingpong);
+                aMatTile, bMatTile, cAccTile, pingpong);
 
-            // Gate THIS BUF's TSTORE on its own mad_s4 done. (Self-gate:
-            // set then wait on the same scalar issuer — still serialises
-            // mad and TSTORE FOR THIS BUF, but the OTHER buf is free to
-            // proceed concurrently.)
-            set_flag(PIPE_M, PIPE_FIX, buf_evt);
-            wait_flag(PIPE_M, PIPE_FIX, buf_evt);
+            // Gate the FIX-pipe TSTORE on mad_s4 done.
+            set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+            wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
-            // Drain int32 partial to the ring slot. FIX pipe is a single
-            // hardware pipe, so TSTOREs from BUF0 and BUF1 still serialize
-            // on FIX itself — ping-pong only buys mad/TSTORE overlap,
-            // not parallel drain. Real FIX-work reduction needs drain
-            // batching (task #122).
+            // Drain int32 partial to the ring slot. 3c-4 perf: this TSTORE
+            // is the FIX-pipe pipe-bound op — 128 KB / iter × 32 iter =
+            // 4 MB / tile, ratio 49.6 % of cube time (msprof). Can't batch
+            // K-blocks before drain because SVDQuant per-64-K ascale/wscale
+            // forces dequant inside the K-loop.
             GlobalRingSlot ringSlot(ws_gm + (uint64_t)slot * kBM * kBN);
-            TSTORE(ringSlot, cTile);
+            TSTORE(ringSlot, cAccTile);
 
             // Tell vec this K-block is consumable.
             ffts_cross_core_sync(PIPE_FIX, pto::getFFTSMsg(0x2, CUBE_TILE_READY));
 
-            // THIS BUF's L0C writable again (next iter that targets this buf).
-            set_flag(PIPE_FIX, PIPE_M, buf_evt);
+            // L0C is again writable for the next mad_s4.
+            set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // This pingpong slot can be re-extracted into.
             set_flag(PIPE_M, PIPE_MTE1, (event_t)pingpong);
         }
 
-        // Drain trailing per-pingpong L0A/B gates.
+        // Drain trailing per-pingpong ping-pong gates.
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-        // Drain trailing FIX→M gates for BOTH L0C bufs (3c-6: was one).
+        // Drain trailing FIX→M gate.
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
 
         // Settle M-pipe + FIX-pipe before fp32 LoRA mad: main K-loop wrote
         // int32 to L0C, want a clean state for the fp32 mad.

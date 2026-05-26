@@ -67,6 +67,47 @@ Implication for design:
 If you can't model L2 hit-rate by inspection, run cce profiler /
 hccl-perf for the L2 hit ratio before tuning the ring layout.
 
+## Hardware: L0C is 128 KB on A2/A3 (910B/910C), not 256 KB
+
+The L0C accumulator buffer on Atlas A2/A3 family parts (910B series,
+including 910B3) is **128 KB**, not 256 KB. The "256 KB" figure
+floats around in scattered AscendC training material and even one
+internal table — it refers to A5, a newer/different architecture
+family. Authoritative source: PTO ISA buffer_limits.
+
+- `pto-isa/include/pto/common/buffer_limits.hpp`:
+  ```cpp
+  #elif defined(PTO_NPU_ARCH_KIRINX90) || defined(PTO_NPU_ARCH_A2A3)
+  #define PTO_L0C_SIZE_BYTES (128u * 1024u)
+  ```
+- `pto-isa/docs/isa/tile/ops/sync-and-config/tassign.md` table:
+  `Acc | L0C | 128 KB (A2A3) | 256 KB (A5) | 64 KB (Kirin9030) | 128 KB (KirinX90)`
+
+A `[128, 256]` int32 acc tile is exactly 128 KB → fills L0C; **no
+room for L0C ping-pong at the current SVDQuant W4A4 cube tile
+shape**. Any "ping-pong BUF0 @ 0, BUF1 @ 128 KB" pattern lifted from
+A5-targeted code will OOB on 910B.
+
+**Fix:** size L0C tiles against 128 KB on 910B. For drain overlap,
+prefer drain-batching (accumulate N K-blocks of mad_s4 into the
+single L0C tile, drain once — halves PIPE_FIX TSTORE count) over
+ping-pong. mad_s4 is `init=true` only on the first K-block of a
+batch; subsequent calls accumulate into the same L0C buffer.
+
+**Diagnostic — what the symptom looks like:**
+
+```
+aicore exception type: L0CADDRESSOVERFLOW
+The operation address of L0C exceeds the maximum range of L0C.
+CCU instruction address check error.
+When the FIXP reads l0c, the read and write operations occur at the
+same address.
+```
+
+If you see this and your code uses any L0C offset ≥ 128 KB on a 910B,
+this is it. The "FIXP reads l0c at same address" wording is misleading
+— it's actually the offset-128KB-or-greater TileAccC that overflows.
+
 ## Hardware: cube minimum addressable = 1 byte (int8); INT4 is mad-internal
 
 PTO `TLoad` / `TExtract` whitelists accept `int8_t / half / bf16 /
