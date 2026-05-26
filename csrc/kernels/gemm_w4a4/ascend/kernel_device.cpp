@@ -139,9 +139,11 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
 
     if ASCEND_IS_AIC {
         // 3c-4 grid M-major: block_idx ∈ [0, blockDim) selects this core's
-        // [block_idx*kBM, block_idx*kBM+kBM) row slice. wgt and wscales are
-        // shared across all blocks (read-only L2).
-        const int64_t block_idx = AscendC::GetBlockIdx();
+        // [block_idx*kBM, block_idx*kBM+kBM) row slice. Use CCE intrinsic
+        // get_block_idx() (cluster idx; same value across cube + vec of the
+        // same cluster — see vec-side note). wgt and wscales are shared
+        // across all blocks (read-only L2).
+        const int64_t block_idx = get_block_idx();
         auto* act_gm = p->act + (uint64_t)block_idx * kBM * kBKPacked;
         auto* wgt_gm = p->wgt;
         auto* ws_gm  = p->workspace
@@ -371,11 +373,13 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         set_vector_mask(-1, -1);
 #endif
 
-        // 3c-4 grid M-major: same block_idx as cube — vec subblocks share
-        // the cluster's index. ws_gm + out_gm + lora_buf are per-block;
-        // ascales has its [kb, m_off:m_off+kBM] strip per block but uses
-        // full-M_total row stride. wscales/bias/wcscales are shared.
-        const int64_t block_idx = AscendC::GetBlockIdx();
+        // 3c-4 grid M-major: same cluster index as cube. NOTE — must use the
+        // CCE intrinsic `get_block_idx()` (returns cluster idx 0..N-1), NOT
+        // `AscendC::GetBlockIdx()`. On dav_c220 the AscendC wrapper returns
+        // `block_idx*g_taskRation + subblockid` (0..2N-1) for AIV, which would
+        // mismatch cube's view of the same cluster. (See
+        // /usr/local/Ascend/.../dav_c220/kernel_operator_common_impl.h:48-65.)
+        const int64_t block_idx = get_block_idx();
         auto* ws_gm   = p->workspace
                       + (uint64_t)block_idx * kRingSlots * kBM * kBN;
         auto* as_gm   = p->ascales;       // base; row stride is p->m_total

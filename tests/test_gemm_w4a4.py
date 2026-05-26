@@ -147,8 +147,8 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         self.assertEqual(out.dtype, torch.float16)
         self.assertEqual(lora_buf.shape, (PHASE3B_M, PHASE3B_N))
         self.assertEqual(lora_buf.dtype, torch.float32)
-        # workspace is [RING_SLOTS=6, M, N] int32; only slots [0:K_BLOCKS] hold valid data
-        self.assertEqual(workspace.shape[1:], (PHASE3B_M, PHASE3B_N))
+        # workspace is [blockDim, RING_SLOTS=6, TILE_M, TILE_N] int32 (3c-4 per-block ring).
+        self.assertEqual(workspace.shape, (N_TILES, 6, TILE_M, TILE_N))
         self.assertEqual(workspace.dtype, torch.int32)
 
         out_cpu = out.cpu()
