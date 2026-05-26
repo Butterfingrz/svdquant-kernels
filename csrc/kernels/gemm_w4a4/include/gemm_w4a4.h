@@ -1,4 +1,7 @@
 #pragma once
+
+#include <cstdint>
+
 // gemm_w4a4 — main SVDQuant W4A4 linear kernel (Ascend C-side header).
 //
 // This header declares the **Ascend-side** C++ entry point only. The
@@ -73,6 +76,7 @@ void gemm_w4a4(void* act, void* wgt,
                void* lora_act_in, void* lora_up,
                void* bias, void* wcscales,
                void* workspace, void* lora_buf, void* out,
+               uint64_t m_total,
                void* stream);
 
 }  // namespace svdquant::ascend

@@ -51,11 +51,16 @@ from baseline.kernels.gemm_w4a4.ref_int4 import (  # noqa: E402
 _step("  baseline ref_int4 loaded OK")
 
 
-# Phase 3c-3 production tile constants — must match svdquant_w4a4_op.cpp + kernel_device.cpp.
-PHASE3B_M = 128
-PHASE3B_K = 2048
-PHASE3B_N = 256
-PHASE3B_R = 32     # LoRA rank — must match kPhase3bR in svdquant_w4a4_op.cpp
+# 3c-4 multi-tile: M_total = TILE_M * N_TILES, exercises grid M-major fanout.
+# Tile-per-block (kTileM/K/N/R) must match svdquant_w4a4_op.cpp + kernel_device.cpp.
+TILE_M = 128
+TILE_K = 2048
+TILE_N = 256
+N_TILES = 2     # 2 AI cores fan out — minimal multi-block coverage
+PHASE3B_M = TILE_M * N_TILES   # 256 — total M rows = 2 cube tiles
+PHASE3B_K = TILE_K
+PHASE3B_N = TILE_N
+PHASE3B_R = 32     # LoRA rank — must match kTileR in svdquant_w4a4_op.cpp
 PHASE3B_K_BLOCK = 64   # per-K-block mad_s4 KS
 PHASE3B_K_BLOCKS = PHASE3B_K // PHASE3B_K_BLOCK   # = 32
 

@@ -89,17 +89,18 @@ enum GemmFftsFlag : uint16_t {
 // these typed pointers from a host-packed struct on entry. Field
 // order MUST match the host-side struct exactly.
 struct DeviceParams {
-    __gm__ uint8_t* act;         // [M, K/2]              packed INT4
-    __gm__ uint8_t* wgt;         // [N, K/2]              packed INT4
-    __gm__ half*    ascales;     // [K/64, M]             fp16 (K-block, M)
-    __gm__ half*    wscales;     // [K/64, N]             fp16 (K-block, N)
-    __gm__ half*    la_fp16;     // [M, R]                fp16 (cast from fp32 host-side)
-    __gm__ half*    lu_T;        // [R, N]                fp16 (transposed host-side)
-    __gm__ half*    bias;        // [N]                   fp16
-    __gm__ half*    wcscales;    // [N]                   fp16
-    __gm__ int32_t* workspace;   // [kRingSlots, M, N]    int32 cube/vec ring
-    __gm__ float*   lora_buf;    // [M, N]                fp32 LoRA-up hand-off
-    __gm__ half*    out;         // [M, N]                fp16 final
+    __gm__ uint8_t* act;         // [M_total, K/2]                  packed INT4
+    __gm__ uint8_t* wgt;         // [N, K/2]                        packed INT4 (shared)
+    __gm__ half*    ascales;     // [K/64, M_total]                 fp16
+    __gm__ half*    wscales;     // [K/64, N]                       fp16 (shared)
+    __gm__ half*    la_fp16;     // [M_total, R]                    fp16
+    __gm__ half*    lu_T;        // [R, N]                          fp16 (shared)
+    __gm__ half*    bias;        // [N]                             fp16 (shared)
+    __gm__ half*    wcscales;    // [N]                             fp16 (shared)
+    __gm__ int32_t* workspace;   // [blockDim, kRingSlots, kBM, N]  int32 cube/vec ring (per-block)
+    __gm__ float*   lora_buf;    // [M_total, N]                    fp32 LoRA-up hand-off
+    __gm__ half*    out;         // [M_total, N]                    fp16 final
+    uint64_t        m_total;     // total M rows = blockDim * kBM
 };
 
 // Tile shape constants — pinned for 3c-3 production single-tile.
@@ -137,9 +138,14 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
     auto* p = (__gm__ const DeviceParams*)params_addr;
 
     if ASCEND_IS_AIC {
-        auto* act_gm = p->act;
+        // 3c-4 grid M-major: block_idx ∈ [0, blockDim) selects this core's
+        // [block_idx*kBM, block_idx*kBM+kBM) row slice. wgt and wscales are
+        // shared across all blocks (read-only L2).
+        const int64_t block_idx = AscendC::GetBlockIdx();
+        auto* act_gm = p->act + (uint64_t)block_idx * kBM * kBKPacked;
         auto* wgt_gm = p->wgt;
-        auto* ws_gm  = p->workspace;
+        auto* ws_gm  = p->workspace
+                     + (uint64_t)block_idx * kRingSlots * kBM * kBN;
 
         using TileMatA = pto::Tile<pto::TileType::Mat, int8_t, kBM, kBKPacked,
                                     pto::BLayout::ColMajor, kBM, kBKPacked,
@@ -304,7 +310,9 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TASSIGN(lutMatTile,  kL1LUTOffset);
         TASSIGN(loraAccTile, 0u);  // L0C BUF0 (after main K-loop drain)
 
-        GlobalLA  laGlobal((__gm__ half*)p->la_fp16);
+        // 3c-4: la_fp16 sliced per-block (each block has its own [kBM, R]
+        // strip), lu_T is shared across blocks.
+        GlobalLA  laGlobal((__gm__ half*)p->la_fp16 + (uint64_t)block_idx * kBM * kR);
         GlobalLUT lutGlobal((__gm__ half*)p->lu_T);
 
         TLOAD(laMatTile, laGlobal);
@@ -329,8 +337,9 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
 
-        // TSTORE L0C fp32 accumulator → lora_buf [M, N] GM.
-        GlobalLoraBuf loraBufGm((__gm__ float*)p->lora_buf);
+        // TSTORE L0C fp32 accumulator → this block's lora_buf [kBM, N] slice.
+        GlobalLoraBuf loraBufGm((__gm__ float*)p->lora_buf
+                                + (uint64_t)block_idx * kBM * kBN);
         TSTORE(loraBufGm, loraAccTile);
 
         // Signal vec that lora_buf holds the fp32 LoRA result.
@@ -362,10 +371,17 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         set_vector_mask(-1, -1);
 #endif
 
-        auto* ws_gm  = p->workspace;
-        auto* as_gm  = p->ascales;
-        auto* wsl_gm = p->wscales;
-        auto* out_gm = p->out;
+        // 3c-4 grid M-major: same block_idx as cube — vec subblocks share
+        // the cluster's index. ws_gm + out_gm + lora_buf are per-block;
+        // ascales has its [kb, m_off:m_off+kBM] strip per block but uses
+        // full-M_total row stride. wscales/bias/wcscales are shared.
+        const int64_t block_idx = AscendC::GetBlockIdx();
+        auto* ws_gm   = p->workspace
+                      + (uint64_t)block_idx * kRingSlots * kBM * kBN;
+        auto* as_gm   = p->ascales;       // base; row stride is p->m_total
+        auto* wsl_gm  = p->wscales;       // shared
+        auto* out_gm  = p->out + (uint64_t)block_idx * kBM * kBN;
+        const uint64_t m_total_rows = p->m_total;
 
         const uint32_t subblockid = get_subblockid();
         const uint32_t row_off    = kVecM * subblockid;  // 0 or 64
@@ -483,12 +499,16 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             // GM offsets:
             //   ring slot row band (this AIV subblock owns rows
             //     [row_off, row_off + kVecM)) into workspace[slot]
-            //   ascales[kb, row_off:row_off+kVecM]
-            //   wscales[kb, :]
-            //   out[row_off:row_off+kVecM, :]
+            //     (ws_gm already pre-offset to this block's ring base)
+            //   ascales[kb, block_idx*kBM + row_off : block_idx*kBM + row_off + kVecM]
+            //     — row stride is m_total_rows, not kBM (multi-block layout)
+            //   wscales[kb, :]                   (shared across blocks)
+            //   out[row_off:row_off+kVecM, :]    (out_gm already pre-offset)
             const uint64_t partial_off =
                 (uint64_t)slot * kBM * kBN + (uint64_t)row_off * kBN;
-            const uint64_t ascale_off  = (uint64_t)kb * kBM + row_off;
+            const uint64_t ascale_off  =
+                (uint64_t)kb * m_total_rows
+                + (uint64_t)block_idx * kBM + row_off;
             const uint64_t wscale_off  = (uint64_t)kb * kBN;
             const uint64_t out_off     = (uint64_t)row_off * kBN;
 
@@ -509,7 +529,9 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             TASSIGN(wscaleF16,   kWscaleF16Off);
             TASSIGN(wscaleF32,   kWscaleF32Off);
 
-            GlobalRingSlot  partGm  (p->workspace + partial_off);
+            // ws_gm is this block's ring base; p->ascales/wscales use the
+            // absolute row offsets computed above.
+            GlobalRingSlot  partGm  (ws_gm        + partial_off);
             GlobalAscaleRow ascaleGm(p->ascales   + ascale_off);
             GlobalWscaleRow wscaleGm(p->wscales   + wscale_off);
 
@@ -609,7 +631,10 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TileLoraF32 loraTile;
         TASSIGN(loraTile, kPartialOff);
 
-        const uint64_t lora_off = (uint64_t)row_off * kBN;
+        // lora_buf laid out [M_total, kBN]; this block's slice starts at
+        // block_idx*kBM, this AIV subblock's strip within that is row_off.
+        const uint64_t lora_off =
+            (uint64_t)block_idx * kBM * kBN + (uint64_t)row_off * kBN;
         GlobalLoraSlice loraGm((__gm__ float*)p->lora_buf + lora_off);
         TLOAD(loraTile, loraGm);
 

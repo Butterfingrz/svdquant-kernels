@@ -29,15 +29,17 @@ namespace svdquant_op {
 
 constexpr auto kNpuDevice = c10::DeviceType::PrivateUse1;
 
-// Phase 3c-3 production tile is hardcoded — must match
+// Phase 3c-4 tile-per-block shape is hardcoded — must match
 // `csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp` constexpr block.
-// Tile-parameterization (3c-2) was skipped; production single-shot bump.
-constexpr int64_t kPhase3bM         = 128;
-constexpr int64_t kPhase3bK         = 2048;
-constexpr int64_t kPhase3bN         = 256;
-constexpr int64_t kPhase3bR         = 32;        // LoRA rank
-constexpr int64_t kPhase3bBlockSize = 64;        // K-block / mad_s4 KS
-constexpr int64_t kPhase3bRingSlots = 6;         // cube/vec int32 hand-off ring depth
+// Tile-parameterization (3c-2) was skipped. Caller-supplied M_total
+// must be a multiple of kTileM; blockDim = M_total / kTileM determines
+// how many AI cores get fanned out.
+constexpr int64_t kTileM      = 128;
+constexpr int64_t kTileK      = 2048;       // K is fixed per tile (single-tile K-loop)
+constexpr int64_t kTileN      = 256;        // N is fixed per tile (no N-tiling yet)
+constexpr int64_t kTileR      = 32;         // LoRA rank
+constexpr int64_t kBlockSize  = 64;         // K-block / mad_s4 KS
+constexpr int64_t kRingSlots  = 6;          // cube/vec int32 ring depth (per-block)
 
 // Shared implementation. `out_lora_buf` / `out_workspace` are optional
 // out-parameters: when non-null, the corresponding internal scratch buffer
@@ -88,24 +90,33 @@ run_gemm_w4a4_impl(const at::Tensor& act,
                 && bias.dim() == 1 && wcscales.dim() == 1,
                 "all tensors must have expected rank (matmul tensors 2D, bias/wcscales 1D)");
 
-    constexpr int64_t kK_packed = kPhase3bK / 2;
-    constexpr int64_t kK_blocks = kPhase3bK / kPhase3bBlockSize;
-    TORCH_CHECK(act.size(0) == kPhase3bM && act.size(1) == kK_packed,
-                "act shape must be [", kPhase3bM, ", ", kK_packed, "] (Phase 3b)");
-    TORCH_CHECK(wgt.size(0) == kPhase3bN && wgt.size(1) == kK_packed,
-                "wgt shape must be [", kPhase3bN, ", ", kK_packed, "] (Phase 3b)");
-    TORCH_CHECK(ascales.size(0) == kK_blocks && ascales.size(1) == kPhase3bM,
-                "ascales shape must be [", kK_blocks, ", ", kPhase3bM, "] (Phase 3b)");
-    TORCH_CHECK(wscales.size(0) == kK_blocks && wscales.size(1) == kPhase3bN,
-                "wscales shape must be [", kK_blocks, ", ", kPhase3bN, "] (Phase 3b)");
-    TORCH_CHECK(lora_act_in.size(0) == kPhase3bM && lora_act_in.size(1) == kPhase3bR,
-                "lora_act_in shape must be [", kPhase3bM, ", ", kPhase3bR, "] (Phase 3b)");
-    TORCH_CHECK(lora_up.size(0) == kPhase3bN && lora_up.size(1) == kPhase3bR,
-                "lora_up shape must be [", kPhase3bN, ", ", kPhase3bR, "] (Phase 3b)");
-    TORCH_CHECK(bias.size(0) == kPhase3bN,
-                "bias shape must be [", kPhase3bN, "] (Phase 3c-1)");
-    TORCH_CHECK(wcscales.size(0) == kPhase3bN,
-                "wcscales shape must be [", kPhase3bN, "] (Phase 3c-1)");
+    constexpr int64_t kK_packed = kTileK / 2;
+    constexpr int64_t kK_blocks = kTileK / kBlockSize;
+
+    // 3c-4: M_total is caller-supplied (must be kTileM multiple). All
+    // M-indexed tensors share that dimension. blockDim = M_total / kTileM
+    // determines how many AI cores fan out for this launch.
+    const int64_t M_total = act.size(0);
+    TORCH_CHECK(M_total > 0 && M_total % kTileM == 0,
+                "act.size(0) = ", M_total, " must be a positive multiple of kTileM = ", kTileM);
+    const int64_t blockDim = M_total / kTileM;
+
+    TORCH_CHECK(act.size(1) == kK_packed,
+                "act.size(1) must be ", kK_packed, " (K/2)");
+    TORCH_CHECK(wgt.size(0) == kTileN && wgt.size(1) == kK_packed,
+                "wgt shape must be [", kTileN, ", ", kK_packed, "]");
+    TORCH_CHECK(ascales.size(0) == kK_blocks && ascales.size(1) == M_total,
+                "ascales shape must be [", kK_blocks, ", ", M_total, "]");
+    TORCH_CHECK(wscales.size(0) == kK_blocks && wscales.size(1) == kTileN,
+                "wscales shape must be [", kK_blocks, ", ", kTileN, "]");
+    TORCH_CHECK(lora_act_in.size(0) == M_total && lora_act_in.size(1) == kTileR,
+                "lora_act_in shape must be [", M_total, ", ", kTileR, "]");
+    TORCH_CHECK(lora_up.size(0) == kTileN && lora_up.size(1) == kTileR,
+                "lora_up shape must be [", kTileN, ", ", kTileR, "]");
+    TORCH_CHECK(bias.size(0) == kTileN,
+                "bias shape must be [", kTileN, "]");
+    TORCH_CHECK(wcscales.size(0) == kTileN,
+                "wcscales shape must be [", kTileN, "]");
     TORCH_CHECK(act.is_contiguous() && wgt.is_contiguous(),
                 "act and wgt must be contiguous");
     TORCH_CHECK(ascales.is_contiguous() && wscales.is_contiguous(),
@@ -121,24 +132,19 @@ run_gemm_w4a4_impl(const at::Tensor& act,
 
     // Device cube path consumes fp16 inputs for the LoRA-up mad and
     // expects lora_up indexed K-first ([R, N]). Cast / transpose
-    // here — both tensors are small (M*R*2 = 4 KB, R*N*2 = 8 KB at
-    // R=32) and live until the launcher returns.
+    // here — la_fp16 is M_total*R*2, lu_T is R*N*2; both still small
+    // at production R=32 (~half KB per row), live until launcher returns.
     auto la_fp16 = lora_act_in.to(at::kHalf);
     auto lu_T = lora_up.t().contiguous();
 
-    // Internal scratch: cube/vec int32 ring + fp32 LoRA-up hand-off.
-    //
-    // Use `at::zeros` (not `at::empty`) — explicit zero-init forces the NPU
-    // allocator to commit physical GM / establish L2 lines before the kernel.
-    // Empirically, at::empty leaves the GM line "cold" in a way that cube
-    // fixpipe TSTORE doesn't reliably land where vec MTE2 reads from. Zero
-    // is also a clean visible "uninitialized" for Python (no sentinel
-    // illusion; see docs/gotchas/ascend.md "tensor.cpu() can return prior
-    // fill").
+    // Internal scratch: per-block cube/vec int32 ring + fp32 LoRA-up
+    // hand-off (one slice per block). See docs/gotchas/ascend.md
+    // "tensor.cpu() can return prior fill" for why we use at::zeros
+    // (cube fixpipe TSTORE doesn't reliably land into cold GM lines).
     auto workspace = at::zeros(
-        {kPhase3bRingSlots, kPhase3bM, kPhase3bN}, i32_options);
-    auto lora_buf = at::zeros({kPhase3bM, kPhase3bN}, fp32_options);
-    auto out = at::empty({kPhase3bM, kPhase3bN}, fp16_options);
+        {blockDim, kRingSlots, kTileM, kTileN}, i32_options);
+    auto lora_buf = at::zeros({M_total, kTileN}, fp32_options);
+    auto out = at::empty({M_total, kTileN}, fp16_options);
 
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
     svdquant::ascend::gemm_w4a4(
@@ -153,6 +159,7 @@ run_gemm_w4a4_impl(const at::Tensor& act,
         workspace.data_ptr(),
         lora_buf.data_ptr(),
         out.data_ptr(),
+        static_cast<uint64_t>(M_total),
         static_cast<void*>(stream));
 
     if (out_lora_buf != nullptr) {
