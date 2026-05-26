@@ -86,7 +86,44 @@ instead of writing AscendC. One `kernel.py` saves having to maintain
 parallel CuTe DSL + AscendC implementations. Compute-bound ops and
 NPU-only ops still belong here.
 
-## Perf — `gemm_w4a4` on 910B3 (Phase 3c-4)
+## Perf — `gemm_w4a4` on 910B3 (Phase 3c-5)
+
+3c-5 wall-clock sweep (`tmp/3c5/bench.log` on `gitcode/scratch/3c5-validated`):
+
+| Tiles | M | µs/call | INT4 GOPS | % peak | scale vs ideal |
+|------:|---:|--------:|----------:|------:|---------------:|
+|  1 |  128 | 183.97 |    730 | 0.14 % | — |
+|  2 |  256 | 171.41 |  1566  | 0.31 % | 2.15× / 2× |
+|  4 |  512 | 174.29 |  3080  | 0.60 % | 4.22× / 4× |
+|  8 | 1024 | 180.91 |  5935  | 1.16 % | 8.14× / 8× |
+| 16 | 2048 | **176.24** | **12185** | **2.38 %** | **16.70× / 16×** |
+| 24 | 3072 | **175.95** | **18308** | **3.58 %** | **25.09× / 24×** |
+
+vs 3c-4 (same shape, dev_params-staging launcher):
+
+| Tiles | 3c-4 µs/call | 3c-5 µs/call | wall lift | GOPS lift |
+|------:|-------------:|-------------:|----------:|----------:|
+| 16 | 318 | 176 | **1.81×** | 6743 → 12185 |
+| 24 | 388 | 176 | **2.21×** | 8286 → 18308 |
+
+Super-linear scaling (16.70×/16×, 25.09×/24×) shows 3c-4 was *host-bound*
+at all tile counts — the ~310 µs floor was per-call overhead, not real
+work. 3c-5 drops the floor to ~170 µs; cube parallelism finally shows.
+
+Remaining gap to plateau: ~120 µs/call host overhead at any tile count
+(176 µs wall − 57 µs device-side kernel). Suspects:
+- `at::zeros({blockDim, kRingSlots, kTileM, kTileN}, int32)` workspace
+  alloc — 6 MB at 16 tiles, 9 MB at 24 tiles. Triggers an NPU zero-fill
+  kernel each call.
+- `lora_act_in.to(at::kHalf)` + `lora_up.t().contiguous()` —
+  intermediate `.to()` + `.contiguous()` each launch their own copy
+  kernel.
+- Python `torch.ops.svdquant.gemm_w4a4` dispatch + tensor metadata
+  checks — ~30 µs per call on torch+torch_npu 2.8.
+
+Task #120 (3c-5b) tracks attribution with `msprof --acl=on`.
+
+## Perf — `gemm_w4a4` on 910B3 (Phase 3c-4, pre-3c-5)
 
 ### Architectural tax: cube/vec partition costs SVDQuant fine-grained dequant
 
