@@ -86,32 +86,81 @@ instead of writing AscendC. One `kernel.py` saves having to maintain
 parallel CuTe DSL + AscendC implementations. Compute-bound ops and
 NPU-only ops still belong here.
 
-## Perf — `gemm_w4a4` on 910B3 (Phase 3c-5)
+## Perf — `gemm_w4a4` on 910B3 (Phase 3c-5: launcher regression repaired)
 
-3c-5 wall-clock sweep (`tmp/3c5/bench.log` on `gitcode/scratch/3c5-validated`):
+**This phase did not improve the kernel.** Device-side MFU is
+unchanged (still 7.9 %); cube pipe ratios are unchanged. 3c-5 just
+removes a self-inflicted host overhead that the 3c-4 launcher had
+introduced.
 
-| Tiles | M | µs/call | INT4 GOPS | % peak | scale vs ideal |
-|------:|---:|--------:|----------:|------:|---------------:|
-|  1 |  128 | 183.97 |    730 | 0.14 % | — |
-|  2 |  256 | 171.41 |  1566  | 0.31 % | 2.15× / 2× |
-|  4 |  512 | 174.29 |  3080  | 0.60 % | 4.22× / 4× |
-|  8 | 1024 | 180.91 |  5935  | 1.16 % | 8.14× / 8× |
-| 16 | 2048 | **176.24** | **12185** | **2.38 %** | **16.70× / 16×** |
-| 24 | 3072 | **175.95** | **18308** | **3.58 %** | **25.09× / 24×** |
+### What happened
 
-vs 3c-4 (same shape, dev_params-staging launcher):
+Phase 3a–3c-4 wrote the host launcher as:
 
-| Tiles | 3c-4 µs/call | 3c-5 µs/call | wall lift | GOPS lift |
-|------:|-------------:|-------------:|----------:|----------:|
-| 16 | 318 | 176 | **1.81×** | 6743 → 12185 |
-| 24 | 388 | 176 | **2.21×** | 8286 → 18308 |
+```cpp
+// per call:
+aclrtMalloc(&dev_params, 96B, HUGE_FIRST);     //  ~80 µs
+aclrtMemcpy(dev_params, &dp, H2D);             //  ~30 µs
+aclrtlaunch_*(blockDim, stream, dev_params);
+aclrtSynchronizeStream(stream);                // ~120 µs (waits for kernel)
+aclrtFree(dev_params);                         //  ~30 µs
+```
 
-Super-linear scaling (16.70×/16×, 25.09×/24×) shows 3c-4 was *host-bound*
-at all tile counts — the ~310 µs floor was per-call overhead, not real
-work. 3c-5 drops the floor to ~170 µs; cube parallelism finally shows.
+…because the auto-gen `aclrtlaunch_*` wrapper for our kernel was
+generated with a single `GM_ADDR params_addr` signature, so we packed
+11 device pointers into a 96 B `DeviceParams` struct on host and
+staged it to device. The blocking sync was needed because `dev_params`
+was malloc'd per-call and had to be freed safely after the kernel
+returned.
 
-Remaining gap to plateau: ~120 µs/call host overhead at any tile count
-(176 µs wall − 57 µs device-side kernel). Suspects:
+The PTO ISA demos (`pto-isa/demos/baseline/gemm_basic/.../utils.h`
+`INVOKE_PTO_KERNEL`) **never had this pattern**. Their kernels are
+declared with variadic `GM_ADDR` args, so the auto-gen wrapper is
+variadic, so the launcher passes pointers directly — no staging, no
+malloc/free, no sync.
+
+3c-5 changes the kernel entry signature from
+`(GM_ADDR params_addr)` to 11 × `GM_ADDR` + `uint64_t`, and the
+launcher to a single `aclrtlaunch_*(blockDim, stream, act, wgt, …,
+m_total)` call. **This is what we should have done from 3a-5
+onward.**
+
+### Bench numbers (`tmp/3c5/bench.log` on `gitcode/scratch/3c5-validated`)
+
+| Tiles | M | 3c-4 µs/call | **3c-5 µs/call** | repaired |
+|------:|---:|---:|---:|---:|
+|  1 |  128 |  309 | **184** | 1.68× |
+| 16 | 2048 |  318 | **176** | **1.81×** |
+| 24 | 3072 |  388 | **176** | **2.21×** |
+
+Super-linear "scaling" 16.70× / ideal 16× and 25.09× / ideal 24× is
+**not real super-linear scaling** — it just reflects that the 3c-4
+floor of ~310 µs was per-call serial overhead masking the parallelism
+that was always there. With the floor lowered to ~170 µs, the
+parallel cube work finally fits inside one wall-clock.
+
+### Why this matters less than it looks
+
+- **Real inference impact is shape-dependent.** Small-batch /
+  latency-sensitive paths (single forward, few tokens) see the
+  improvement because the per-op blocking sync is the bottleneck.
+  Large-batch / heavy-kernel paths (longer K, more tiles, more LoRA
+  rank) wouldn't notice — kernel runtime would already mask the host
+  overhead.
+- **Device-side MFU is unchanged.** Cube pipe ratios (FIX 49.6 %, MAC
+  6.7 %) are still where 3c-4 measured them. Real cube speedups (L0C
+  ping-pong, drain batching) are separate work, tracked under their
+  own optimization vectors below.
+- **The 3c-4 perf snapshot below mis-framed the 260 µs as "host
+  overhead" as if it were a fundamental ACL cost.** It wasn't. It was
+  our launcher pattern. Leave the snapshot as a record of the pre-fix
+  state, but read it with that caveat.
+
+### Residual ~120 µs / call host overhead (task #120, real)
+
+After the launcher fix, wall plateaus at ~176 µs vs 57 µs kernel →
+~120 µs / call still spent on the host. Unlike the prior 260 µs, this
+is NOT under our launcher's control:
 - `at::zeros({blockDim, kRingSlots, kTileM, kTileN}, int32)` workspace
   alloc — 6 MB at 16 tiles, 9 MB at 24 tiles. Triggers an NPU zero-fill
   kernel each call.
@@ -119,11 +168,23 @@ Remaining gap to plateau: ~120 µs/call host overhead at any tile count
   intermediate `.to()` + `.contiguous()` each launch their own copy
   kernel.
 - Python `torch.ops.svdquant.gemm_w4a4` dispatch + tensor metadata
-  checks — ~30 µs per call on torch+torch_npu 2.8.
+  checks — ~30 µs / call on torch+torch_npu 2.8.
 
-Task #120 (3c-5b) tracks attribution with `msprof --acl=on`.
+Task #120 (3c-5b) tracks attribution with `msprof --acl=on`. Same
+caveat applies though — most of this overhead overlaps with device
+exec in steady-state inference, so further reduction is mainly a
+latency-not-throughput improvement.
 
 ## Perf — `gemm_w4a4` on 910B3 (Phase 3c-4, pre-3c-5)
+
+> ⚠ **The "host overhead 260 µs / call" reported below was self-
+> inflicted by the 3c-4 launcher pattern, NOT a property of Ascend
+> ACL launch.** See the 3c-5 section above for what actually happened
+> and what the real per-call host floor (~75 µs ACL launch + ~30 µs
+> Python dispatch + workspace alloc) looks like once the launcher is
+> written the way PTO ISA's demos do it. The device-side cube /
+> vec pipe ratios in the msprof breakdown below are still accurate —
+> only the wall-clock and "host overhead" framings need that caveat.
 
 ### Architectural tax: cube/vec partition costs SVDQuant fine-grained dequant
 

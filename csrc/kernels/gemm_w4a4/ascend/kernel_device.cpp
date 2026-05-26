@@ -92,8 +92,12 @@
 //   2. Per-2-K-block drain batching in vec UB — halves FIX freq but
 //      doubles UB scratch (already 135 / 184 KB used).
 //   3. (Done — 3c-5) PTO-style variadic launch on host (kernel.cpp).
-//      Killed the 260 µs/call launch overhead by dropping the
-//      DeviceParams aclrtMalloc/Memcpy/Sync/Free staging dance.
+//      This was *not* an optimization — it repaired a launcher
+//      regression from Phase 3a-5 that the PTO demos never had.
+//      Phase 3a–3c-4 packed 11 device pointers into a host
+//      DeviceParams struct + aclrtMalloc/Memcpy/Sync/Free per call;
+//      PTO's INVOKE_PTO_KERNEL pattern uses variadic GM_ADDR args
+//      directly. Device-side MFU unchanged after the fix.
 // ──────────────────────────────────────────────────────────────────────
 
 #include "kernel_operator.h"
