@@ -156,9 +156,11 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         self.assertEqual(out.dtype, torch.float16)
         self.assertEqual(lora_buf.shape, (PHASE3B_M, PHASE3B_N))
         self.assertEqual(lora_buf.dtype, torch.float32)
-        # workspace is [blockDim, RING_SLOTS=6, TILE_M, TILE_N] int32 (3c-4 per-block ring).
+        # workspace is [blockDim, RING_SLOTS=6, TILE_M, TILE_N] fp16
+        # (3c-7: × wscale folded by cube FIX-pipe VDEQF16 — slot is the
+        # post-dequant fp16 partial, not raw int32).
         self.assertEqual(workspace.shape, (N_TILES, 6, TILE_M, TILE_N))
-        self.assertEqual(workspace.dtype, torch.int32)
+        self.assertEqual(workspace.dtype, torch.float16)
 
         out_cpu = out.cpu()
         lora_buf_cpu = lora_buf.cpu()
