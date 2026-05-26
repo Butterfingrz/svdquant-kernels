@@ -88,9 +88,39 @@ NPU-only ops still belong here.
 
 ## Perf — `gemm_w4a4` on 910B3 (Phase 3c-4)
 
-Status: multi-tile launch validated (grid M-major,
-`blockDim = M_total / kTileM`); WebIDE 910B3 numerical pass
-`out vs ref max_abs ≈ 0.008` independent of `N_TILES`.
+### Architectural tax: cube/vec partition costs SVDQuant fine-grained dequant
+
+Before any kernel-side number, the big picture: SVDQuant has per-64-K-block
+ascale/wscale, so the math forces an int32→fp32 dequant **inside** the K-loop.
+On the two backends this lands very differently:
+
+| | nunchaku (CUDA SM) | this kernel (Ascend cube + vec) |
+|---|---|---|
+| `mma` output location | per-thread registers (SM-private RF) | **L0C 128 KB** (cube-private SRAM) |
+| Where the dequant runs | same warp's CUDA cores | **vec unit** — physically separate core |
+| `mma`→dequant data flow | zero-copy (regs → regs) | **L0C → GM ring → UB** (via L2) |
+| Per-K-block drain | none — `fpsum` stays in regs | **1 drain × 128 KB × 32 K-blocks = 4 MB / tile** |
+| K-loop tail store | 1 × `fpsum`→GM | 1 × `out`→GM (after vec finishes) |
+
+Reference for the CUDA path: `tmp/nunchaku/src/kernels/zgemm/gemm_base.cuh:367-409`
+`apply_scales` — it just does `__hfma2(int2half2(psum), asx * ws, fsum)` inline
+in the warp; the `mma` callback returns an int32 register tile that the next
+two instructions consume directly. There is no L0C-equivalent on a CUDA SM
+because the matmul output IS already in the same register file the dequant
+reads from.
+
+On Ascend the cube and vec are **physically distinct hardware** with no shared
+SRAM — L0C is cube-only, UB is vec-only. So every fine-grained dequant pass
+must round-trip through GM (L2-resident in practice, never HBM — see
+[gotchas/ascend.md](./gotchas/ascend.md) cube↔vec L2 entry). This is the
+**architectural tax** that drives the FIX-pipe ratio we measure below; it is
+not an implementation gap.
+
+### Status
+
+Multi-tile launch validated (grid M-major, `blockDim = M_total / kTileM`);
+WebIDE 910B3 numerical pass `out vs ref max_abs ≈ 0.008` independent of
+`N_TILES`.
 
 ### Wall-clock sweep (`tmp/bench_3c4_sweep.py`)
 

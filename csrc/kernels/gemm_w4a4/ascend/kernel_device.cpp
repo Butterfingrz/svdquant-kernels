@@ -72,12 +72,19 @@
 //   MTE1 (L1→L0A/B TEXTRACT):    4.4 %
 //   bubble:                     ~34 %    (mostly cube ↔ vec back-pressure)
 //
-// Why FIX dominates: SVDQuant requires per-64-K-block ascale/wscale, so
-// every K-block we drain a 128 KB int32 partial from L0C into the GM
-// ring (32× per tile, 4 MB/tile). Single-buf L0C forces MAC and FIX to
-// serialize per K-block — MAC can't overlap drain. This is an algorithm
-// cost, not an implementation bug; standard dense GEMMs avoid it by
-// accumulating L0C across all K and draining once.
+// Why FIX dominates — it's an architectural tax, not an algorithm bug.
+// SVDQuant requires per-64-K-block ascale/wscale, so the math forces
+// dequant inside the K-loop on every backend. On CUDA SMs that's free
+// (Tensor Core mma writes to per-thread registers, the same warp's
+// CUDA cores do the dequant inline — see nunchaku's apply_scales at
+// gemm_base.cuh:367, no drain at all). On Ascend, cube and vec are
+// physically separate hardware with no shared SRAM, so every fine-
+// grained dequant must round-trip int32 partial L0C → GM → UB.
+// 32× per tile × 128 KB = 4 MB / tile drained through FIX.
+// Single-buf L0C additionally serializes MAC vs FIX, which makes the
+// drain cost wallclock-visible rather than overlapped.
+// See docs/npu.md § "Architectural tax" for the full cube/vec vs
+// CUDA SM comparison table.
 //
 // Optimization opportunities (in `docs/npu.md` § "Perf"):
 //   1. L0C ping-pong (BUF0 / BUF1) — MAC can run while FIX drains the
