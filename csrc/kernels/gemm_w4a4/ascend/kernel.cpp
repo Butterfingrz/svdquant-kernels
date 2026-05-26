@@ -15,8 +15,15 @@
 //
 // Synchronization: this launcher synchronizes after `aclrtlaunch_*`
 // before freeing the staging `dev_params` to avoid use-after-free.
-// Phase 3c-5+ will revisit per-call aclrtMalloc by using a stream-
-// resident pre-allocated params buffer.
+//
+// 3c-4 perf bottleneck: per-call `aclrtMalloc` + `aclrtMemcpy(96 B)` +
+// blocking `aclrtSynchronizeStream` add up to ~260 µs/call (msprof
+// reports 57 µs device-side vs 318 µs wall at 16 tiles). The kernel
+// itself is fine — wall-time MFU is 1.3 % only because of this host
+// path. Phase 3c-5+ will move dev_params to a stream-resident pre-
+// allocated buffer (refilled per call rather than malloc'd) and drop
+// the blocking sync once a torch_npu graph executor owns the stream.
+// See docs/npu.md § "Perf — gemm_w4a4 on 910B3 (Phase 3c-4)".
 
 #include "gemm_w4a4.h"
 

@@ -62,6 +62,31 @@
 //
 // `__enable_feature_for_compile_default = KERNEL_TYPE_MIX_AIC_1_2`
 // keeps the auto-gen wrapper in mix mode (1 cube : 2 vec).
+//
+// ─────────── Phase 3c-4 perf snapshot (msprof, 16 tiles, 910B3) ───────────
+//
+// Cube pipe ratios (median over 25 captured calls, --aic-metrics=PipeUtilization):
+//   FIX (L0C→GM TSTORE drain):  49.6 %   ← dominant pipe
+//   MAC (mad_s4):                6.7 %   ← cube math itself is light
+//   MTE2 (GM→L1 TLOAD):          5.3 %
+//   MTE1 (L1→L0A/B TEXTRACT):    4.4 %
+//   bubble:                     ~34 %    (mostly cube ↔ vec back-pressure)
+//
+// Why FIX dominates: SVDQuant requires per-64-K-block ascale/wscale, so
+// every K-block we drain a 128 KB int32 partial from L0C into the GM
+// ring (32× per tile, 4 MB/tile). Single-buf L0C forces MAC and FIX to
+// serialize per K-block — MAC can't overlap drain. This is an algorithm
+// cost, not an implementation bug; standard dense GEMMs avoid it by
+// accumulating L0C across all K and draining once.
+//
+// Optimization opportunities (in `docs/npu.md` § "Perf"):
+//   1. L0C ping-pong (BUF0 / BUF1) — MAC can run while FIX drains the
+//      other buffer. Expected MAC ratio 6.7 % → ~30 %. Cube-side only.
+//   2. Per-2-K-block drain batching in vec UB — halves FIX freq but
+//      doubles UB scratch (already 135 / 184 KB used).
+//   3. Pre-allocated dev_params on host (kernel.cpp) — kills the
+//      260 µs/call launch overhead currently dominating wall clock.
+// ──────────────────────────────────────────────────────────────────────
 
 #include "kernel_operator.h"
 #include <pto/pto-inst.hpp>
@@ -178,7 +203,11 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
         TileAccC cAccTile;
         TASSIGN(aMatTile, kL1AByteOffset);
         TASSIGN(bMatTile, kL1BByteOffset);
-        TASSIGN(cAccTile, 0u);  // L0C single buffer
+        // 3c-4 perf: L0C single-buf forces MAC ⇄ FIX serialization.
+        // msprof shows MAC 6.7 % / FIX 49.6 %. BUF0/BUF1 ping-pong is the
+        // single biggest cube-side win — see top-of-file perf snapshot
+        // and docs/npu.md § "Perf".
+        TASSIGN(cAccTile, 0u);  // L0C BUF0 (single buffer; see perf note above)
 
         GlobalA aGlobal((__gm__ int8_t*)act_gm);
         GlobalB bGlobal((__gm__ int8_t*)wgt_gm);
@@ -242,7 +271,11 @@ svdquant_gemm_w4a4_kernel(GM_ADDR params_addr) {
             set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
             wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
-            // Drain int32 partial to the ring slot.
+            // Drain int32 partial to the ring slot. 3c-4 perf: this TSTORE
+            // is the FIX-pipe pipe-bound op — 128 KB / iter × 32 iter =
+            // 4 MB / tile, ratio 49.6 % of cube time (msprof). Can't batch
+            // K-blocks before drain because SVDQuant per-64-K ascale/wscale
+            // forces dequant inside the K-loop.
             GlobalRingSlot ringSlot(ws_gm + (uint64_t)slot * kBM * kBN);
             TSTORE(ringSlot, cAccTile);
 
