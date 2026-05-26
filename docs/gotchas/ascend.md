@@ -10,6 +10,36 @@ Organized roughly by hardware layer (top) → PTO ISA layer (bottom).
 
 ---
 
+## AscendC: `AscendC::GetBlockIdx()` returns DIFFERENT values for AIC vs AIV in mix mode
+
+On dav_c220 (910B) in mix mode `KERNEL_TYPE_MIX_AIC_1_2`, the high-level
+`AscendC::GetBlockIdx()` wrapper returns:
+
+- **AIC**: `get_block_idx()` → cluster idx (0..N-1, where N = blockDim)
+- **AIV**: `get_block_idx() * g_taskRation + get_subblockid()` → 0..2N-1
+
+So vec's "block_idx" is **2×** what cube sees for the same cluster.
+If you compute GM slice offsets in both branches as `block_idx * tile_size`,
+cube writes cluster K's slice but vec K's two subblocks see "block_idx"
+2K and 2K+1, both slicing the *wrong* GM regions. Symptoms: numerical
+garbage, sometimes out-of-bounds reads, output magnitude is right
+(~real-scale random) but elementwise wrong.
+
+Source: `/usr/local/Ascend/.../dav_c220/kernel_operator_common_impl.h:47-65`.
+
+**Fix:** use the CCE intrinsic `get_block_idx()` directly in both AIC
+and AIV branches — it returns the cluster index on both. For sub-cluster
+indexing within AIV, use `get_subblockid()` (which returns 0 or 1 in
+mix 1:2). This is what the existing `row_off = kVecM * get_subblockid()`
+pattern already does.
+
+**Diagnostic:** if multi-block kernel passes single-block (blockDim=1)
+but fails multi-block (blockDim≥2) with reasonable-magnitude wrong
+output (not zero, not NaN), and your slicing offsets use
+`AscendC::GetBlockIdx()` in vec, this is it.
+
+---
+
 ## Hardware: cube↔vec handoff is L2-resident, not HBM round-trip
 
 A2/A3 cube and vec have physically isolated on-chip storage (L0C vs
