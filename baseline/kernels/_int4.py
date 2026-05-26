@@ -117,6 +117,48 @@ def dequantize_int4_rows(
 
 
 # -------------------------------------------------------------------------
+# Ascend FIX-pipe VDEQF16 deqscalar pack
+#
+# dav_c220 FIX-pipe quantization mode `VDEQF16` (int32 L0C → fp16 GM with
+# per-N-column scale fold) reads a uint64 deqscalar per output column.
+# Bit layout (from PTO ISA `extract_quant_params`,
+# `pto-isa/tests/.../tstore_acc2gm/gen_data.py:44-55`):
+#
+#   bits[32:13]   m1 — 19-bit mini-float (sign + 8-bit exp + 10-bit mantissa)
+#   bits[45:37]   offset    (0 for symmetric SVDQuant)
+#   bit[46]       sign flag (0 for fp16 dst)
+#
+# Storing `fp32(scale)` reinterpret in low 32 bits gets the right encoding
+# automatically — bits[31:13] of fp32 ARE the 19-bit mini-float (the
+# hardware truncates the bottom 13 mantissa bits, matching the bit
+# layout). fp16 → fp32 is exact; fp32 → 19-bit mini-float drops the bottom
+# 13 fp32 mantissa bits, which for fp16-sourced scales were already zero.
+# Net: lossless when source is fp16.
+#
+# `wscales` in our Ascend kernel are `[K/64, N]` fp16. Packing maps to
+# `[K/64, N]` uint64 (the cube reads `wscales_packed[kb, :N]` per K-block,
+# stages it through L1 to the 2 KB FBuffer, then `TStoreAccFp<VDEQF16>`
+# applies × wscale during drain — see task #124, docs/kernels/gemm_w4a4*.md
+# bring-up notes).
+# -------------------------------------------------------------------------
+
+def pack_wscales_vdeqf16(wscales_fp16: torch.Tensor) -> torch.Tensor:
+    """`[..., N]` fp16 → `[..., N]` uint64 — FIX-pipe VDEQF16 deqscalar.
+
+    Symmetric SVDQuant: offset and sign-flag bits stay zero. Output is
+    contiguous along the last axis; per-K-block slicing on a 2-D input
+    `[K/B, N]` yields the GM ring slot of `wscale_packed[kb, :N]` the
+    cube K-loop loads once per K-block.
+    """
+    assert wscales_fp16.dtype == torch.float16, (
+        f"wscales must be fp16, got {wscales_fp16.dtype}"
+    )
+    fp32 = wscales_fp16.to(torch.float32).contiguous()
+    u32 = fp32.view(torch.uint32)
+    return u32.to(torch.uint64)
+
+
+# -------------------------------------------------------------------------
 # nunchaku INT4 layout adapters
 #
 # nunchaku's CUDA INT4 path stores scales (and packed nibbles) in
