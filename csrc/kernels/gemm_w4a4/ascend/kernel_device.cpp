@@ -318,7 +318,7 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
 
         for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
             const uint64_t pingpong = kb & 1;
-            const uint32_t slot     = kb % kRingSlots;
+            (void)kb;  // slot intentionally unused — #127 probe skips TSTORE_FP
 
             // Back-pressure: after the ring's filled once, vec must
             // free a slot for each subsequent producer iter.
@@ -326,58 +326,48 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
                 wait_flag_dev(VEC_TILE_CONSUMED);
             }
 
-            // Slide L1 view to the kb-th K-block. Strides:
-            //   A: kKSPacked * kBM bytes per K-block (M-fast ColMajor BLayout)
-            //   B: kKSPacked * kBN bytes per K-block (K-fast RowMajor BLayout)
+            // Slide L1 view to the kb-th K-block.
             TASSIGN(aMatTile, kL1A_base + (uint64_t)kb * kKSPacked * kBM);
             TASSIGN(bMatTile, kL1B_base + (uint64_t)kb * kKSPacked * kBN);
 
-            // 3c-7: load wscale_packed[kb, :N] from GM → L1 staging tile.
-            // Can overlap with mad_s4 (different pipes).
-            GlobalWscalePacked wscalePackedGm(
-                p->wscales + (uint64_t)kb * kBN);
-            TLOAD(wscaleMatTile, wscalePackedGm);
+            // 3c-7 PROBE #127: SKIP TLOAD wscale + TMOV(L1→FBuffer) +
+            // TStoreAccFp. Goal: isolate whether 32× TStoreAccFp freezes
+            // FIX-pipe such that post-K-loop TSTORE no-ops (#126 evidence:
+            // both the drain probe AND LoRA TSTORE wrote nothing — bytes
+            // in lora_buf stayed at at::zeros). If LoRA writes correctly
+            // when K-loop never touches FIX-pipe / set_fpc / FBuffer,
+            // the freeze hypothesis is confirmed. Main path will be zero
+            // (workspace stays at::zeros), but we don't care — only the
+            // LoRA TSTORE's success matters for this probe.
+            //
+            // Removed in this probe:
+            //   - TLOAD(wscaleMatTile, ...)   (no wscale staging)
+            //   - set_flag(PIPE_MTE2, PIPE_FIX, EVENT_ID2)
+            //   - wait_flag(PIPE_MTE2, PIPE_FIX, EVENT_ID2)
+            //   - TMOV(wscaleScalingTile, wscaleMatTile)
+            //   - TSTORE_FP(ringSlot, cAccTile, wscaleScalingTile)
+            //
+            // Kept:
+            //   - mad_s4 (32×, init=true overwrite — exercises L0C the
+            //     same way the real K-loop would; ensures L0C dtype
+            //     tracking goes through identical mad_s4 sequence)
+            //   - FFTS CUBE_TILE_READY signal so vec proceeds
+            //   - L0A/B ping-pong sync (mad_s4 needs it)
+            //
+            // L0C cleanup: with no TSTORE draining L0C between mads, the
+            // FIX→M event isn't actually signaled by hardware. We skip
+            // its wait/set entirely.
 
-            // Wait L0C is free (prev TSTORE_FP drained on FIX pipe).
-            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-            // Wait this ping-pong's L0A/B slot is free (prev mad_s4 drained).
+            // Wait this ping-pong's L0A/B slot is free.
             wait_flag(PIPE_M, PIPE_MTE1, (event_t)pingpong);
 
             pto::pto_macro_matmul_s4_block<kBM, kBN, kKSLogical>(
                 aMatTile, bMatTile, cAccTile, pingpong);
 
-            // Gate the FIX-pipe drain on mad_s4 done.
-            set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-
-            // Gate the L1→FBuffer copy on the MTE2 wscale load above
-            // (so the Scaling tile has this K-block's deqscalar before
-            // TSTORE_FP's pipe_barrier(PIPE_FIX) runs).
-            set_flag(PIPE_MTE2, PIPE_FIX, EVENT_ID2);
-
-            wait_flag(PIPE_MTE2, PIPE_FIX, EVENT_ID2);
-            // L1 (Mat, uint64) → FBuffer (Scaling). copy_cbuf_to_fbuf
-            // dispatches on PIPE_FIX (same queue as TSTORE_FP below), so
-            // the two are naturally serialized via TSTORE_FP's internal
-            // `set_fpc + pipe_barrier(PIPE_FIX)` and no explicit
-            // MTE1→FIX flag is needed — see the PTO testcase
-            // `tstore_acc2gm_kernel.cpp:445-451`.
-            TMOV(wscaleScalingTile, wscaleMatTile);
-
-            wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-
-            // FIX-pipe drain with VDEQF16 (auto-selected via
-            // GetVectorPreQuantMode<int32_t, half> from TileData / GlobalData
-            // dtypes — see pto-isa/.../a2a3/TStore.hpp:667). int32 L0C ×
-            // FBuffer-resident wscale[kb, :N] → fp16 ring slot.
-            // Drain bytes: 128 KB → 64 KB per K-block (half the int32 path).
-            GlobalRingSlot ringSlot(ws_gm + (uint64_t)slot * kBM * kBN);
-            TSTORE_FP(ringSlot, cAccTile, wscaleScalingTile);
-
-            // Tell vec this K-block is consumable.
+            // Signal vec without any FIX-pipe drain. The FFTS sync still
+            // uses PIPE_FIX as its issuing pipe, but no payload op runs.
             ffts_cross_core_sync(PIPE_FIX, pto::getFFTSMsg(0x2, CUBE_TILE_READY));
 
-            // L0C is again writable for the next mad_s4.
-            set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // This pingpong slot can be re-extracted into.
             set_flag(PIPE_M, PIPE_MTE1, (event_t)pingpong);
         }
@@ -385,13 +375,11 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
         // Drain trailing per-pingpong ping-pong gates.
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-        // Drain trailing FIX→M gate.
-        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        // #127 PROBE: skip FIX→M drain wait (no FIX op fired in K-loop).
 
-        // Settle M-pipe + FIX-pipe before fp32 LoRA mad: main K-loop wrote
-        // int32 to L0C, want a clean state for the fp32 mad.
+        // Settle M-pipe before fp32 LoRA mad: main K-loop wrote int32 to
+        // L0C via mad_s4, want clean state for fp32 mad.
         pipe_barrier(PIPE_M);
-        pipe_barrier(PIPE_FIX);
 
         // Drain trailing VEC_TILE_CONSUMED signals. Vec fires once per
         // K-block (kNumKBlocks total); cube consumed (kNumKBlocks - kActualPreload)
@@ -400,44 +388,10 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
 
-        // 3c-7 debug probe (task #126): force a plain NoQuant TSTORE drain
-        // to unwind FIX-pipe state before LoRA pass.
-        //
-        // Hypothesis: K-loop's 32 consecutive TStoreAccFp calls
-        // (pto-isa/.../a2a3/TStore.hpp:470) each set_fpc(deqTensorAddr) and
-        // drive the fixpipe through VDEQF16 mode. Even though
-        // GetCastPreQuantMode<float,float> returns NoQuant for LoRA's plain
-        // TSTORE, the hardware fixpipe state machine on dav_c220 may keep a
-        // sticky vector-quant latch that suppresses the subsequent NoQuant
-        // drain, manifesting as lora_buf all-zeros.
-        //
-        // Task #125's `set_fpc(0) + pipe_barrier(PIPE_FIX)` alone didn't
-        // help — confirms FPC register reset isn't enough; the state
-        // machine itself needs to be cycled through a NoQuant path.
-        //
-        // Probe: drain L0C's residual int32 (still holds kb=31 mad_s4
-        // partial) as plain int32 → int32 NoQuant via the standard
-        // TStoreAcc dispatch. Target is lora_buf reinterpreted as int32
-        // — its content is overwritten by the LoRA TSTORE 30 lines below,
-        // so the drain's actual bytes don't matter; we only care that the
-        // hardware took the plain-NoQuant code path. If LoRA's TSTORE
-        // succeeds after this, FIX-pipe state-machine residue is confirmed.
-        set_fpc(0);
-        {
-            using TileAccCDrain = pto::TileAcc<int32_t, kBM, kBN, kBM, kBN>;
-            using GlobalLoraBufAsInt32 = pto::GlobalTensor<int32_t,
-                pto::Shape<1, 1, 1, kBM, kBN>,
-                pto::Stride<1, 1, 1, kBN, 1>>;
-            TileAccCDrain drainAcc;
-            TASSIGN(drainAcc, 0u);  // L0C BUF0 (int32 from kb=31 mad_s4)
-            GlobalLoraBufAsInt32 drainGm(
-                (__gm__ int32_t*)p->lora_buf
-                + (uint64_t)block_idx * kBM * kBN);
-            TSTORE(drainGm, drainAcc);
-            set_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
-            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
-        }
-        pipe_barrier(PIPE_FIX);
+        // 3c-7 PROBE #127: NO FIX-pipe drains in K-loop, so no set_fpc /
+        // FBuffer / TStoreAccFp ran. LoRA cube TSTORE follows on a "fresh"
+        // FIX-pipe. If lora_buf comes back non-zero, FIX-pipe freeze after
+        // 32× TStoreAccFp is confirmed (#126 evidence).
 
         // ===== LoRA-up cube pass =====
         // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → lora_buf [M, N].
