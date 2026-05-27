@@ -5,6 +5,12 @@ One markdown file per op as kernels mature, e.g.:
 - `gemm_w4a4.md` — `tcgen05` scaled-MMA tile shape, scale handling,
   LoRA-up epilogue register budget, optional next-layer quantize
   fusion.
+- `gemm_w4a4_fa4_v0_bringup.md` — CUDA path FA4-style scheduling
+  bring-up notes.
+- `gemm_w4a4-vdeqf16-attempt.md` — abandoned 3c-7 attempt to fold per-N
+  wscale apply from vec into cube FIX-pipe via `TSTORE_FP<VDEQF16>`;
+  main path numerically worked, LoRA-up silently broke
+  (`lora_buf=exact zero`), root cause never localized in 5 probes.
 - `quantize_w4a4_act_fuse_lora.md` — Triton SMEM tiling, LoRA-down
   reduction plan, NVFP4 E2M1 packing layout, per-16-K-block FP8
   scale write path.
