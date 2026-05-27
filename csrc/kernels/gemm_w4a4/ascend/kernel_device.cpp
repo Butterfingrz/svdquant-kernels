@@ -217,6 +217,94 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
         auto* ws_gm  = p->workspace
                      + (uint64_t)block_idx * kRingSlots * kBM * kBN;
 
+        // ===== 3c-7 PROBE #128: LoRA pass FIRST (before K-loop) =====
+        // #127 ruled out FIX-pipe state and K-loop FIX residue. Probe #128
+        // tests: does the LoRA cube pass write correctly when run on a
+        // PRISTINE cube (no prior mad_s4, no prior FIX activity, no prior
+        // TLOAD/TEXTRACT) — i.e., FIRST cube op in the kernel?
+        //
+        // If lora_buf comes back non-zero matching ref_lora_buf → some
+        // K-loop side effect (likely mad_s4 leaving L0C in int32 mode
+        // such that subsequent fp32 mad init=true silently no-ops, or L1
+        // overlap, or L0A/B pingpong residue) is what kills LoRA. Need
+        // to figure out which K-loop op specifically.
+        //
+        // If still zero → LoRA cube pass code itself is broken regardless
+        // of state. Need to bisect a20877f (3c-7 init) against a58a5ac
+        // (3c-5 last working) for the LoRA-pass-affecting change.
+        {
+            constexpr uint64_t kL1LAOffset_pre  = 16u * 1024;
+            constexpr uint64_t kL1LUTOffset_pre = kL1LAOffset_pre
+                                                + (uint64_t)kBM * kR * sizeof(half);
+
+            using TileMatLA_pre  = pto::Tile<pto::TileType::Mat, half, kBM, kR,
+                                              pto::BLayout::ColMajor, kBM, kR,
+                                              pto::SLayout::RowMajor, 512>;
+            using TileMatLUT_pre = pto::Tile<pto::TileType::Mat, half, kR, kBN,
+                                              pto::BLayout::ColMajor, kR, kBN,
+                                              pto::SLayout::RowMajor, 512>;
+            using TileAccLora_pre = pto::TileAcc<float, kBM, kBN, kBM, kBN>;
+            using LeftTileLora_pre  = pto::TileLeft<half, kBM, kR, kBM, kR>;
+            using RightTileLora_pre = pto::TileRight<half, kR, kBN, kR, kBN>;
+
+            using GlobalLA_pre = pto::GlobalTensor<half,
+                pto::Shape<1, 1, 1, kBM, kR>,
+                pto::Stride<1, 1, 1, kR, 1>>;
+            using GlobalLUT_pre = pto::GlobalTensor<half,
+                pto::Shape<1, 1, 1, kR, kBN>,
+                pto::Stride<1, 1, 1, kBN, 1>>;
+            using GlobalLoraBuf_pre = pto::GlobalTensor<float,
+                pto::Shape<1, 1, 1, kBM, kBN>,
+                pto::Stride<1, 1, 1, kBN, 1>>;
+
+            TileMatLA_pre   laMatTile_pre;
+            TileMatLUT_pre  lutMatTile_pre;
+            TileAccLora_pre loraAccTile_pre;
+            TASSIGN(laMatTile_pre,   kL1LAOffset_pre);
+            TASSIGN(lutMatTile_pre,  kL1LUTOffset_pre);
+            TASSIGN(loraAccTile_pre, 0u);  // L0C BUF0 (pristine)
+
+            GlobalLA_pre  laGlobal_pre((__gm__ half*)p->la_fp16
+                                        + (uint64_t)block_idx * kBM * kR);
+            GlobalLUT_pre lutGlobal_pre((__gm__ half*)p->lu_T);
+
+            TLOAD(laMatTile_pre, laGlobal_pre);
+            TLOAD(lutMatTile_pre, lutGlobal_pre);
+
+            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+            wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+
+            LeftTileLora_pre  aLoraL0_pre;
+            RightTileLora_pre bLoraL0_pre;
+            TASSIGN(aLoraL0_pre, 0u);
+            TASSIGN(bLoraL0_pre, 0u);
+
+            TEXTRACT(aLoraL0_pre, laMatTile_pre,  0, 0);
+            TEXTRACT(bLoraL0_pre, lutMatTile_pre, 0, 0);
+
+            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+            wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+
+            TMATMUL(loraAccTile_pre, aLoraL0_pre, bLoraL0_pre);
+
+            set_flag(PIPE_M, PIPE_FIX, EVENT_ID3);
+            wait_flag(PIPE_M, PIPE_FIX, EVENT_ID3);
+
+            GlobalLoraBuf_pre loraBufGm_pre((__gm__ float*)p->lora_buf
+                                            + (uint64_t)block_idx * kBM * kBN);
+            TSTORE(loraBufGm_pre, loraAccTile_pre);
+
+            // Drain LoRA TSTORE before reusing L0C / L1 for K-loop.
+            set_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
+            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
+
+            // Signal vec early — vec will consume LORA_BUF_READY at end of
+            // its K-loop, the signal sticks.
+            ffts_cross_core_sync(PIPE_FIX,
+                                  pto::getFFTSMsg(0x2, LORA_BUF_READY));
+        }
+        // ===== End probe #128: LoRA pass done before K-loop =====
+
         using TileMatA = pto::Tile<pto::TileType::Mat, int8_t, kBM, kBKPacked,
                                     pto::BLayout::ColMajor, kBM, kBKPacked,
                                     pto::SLayout::RowMajor, 512>;
@@ -388,85 +476,9 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
 
-        // 3c-7 PROBE #127: NO FIX-pipe drains in K-loop, so no set_fpc /
-        // FBuffer / TStoreAccFp ran. LoRA cube TSTORE follows on a "fresh"
-        // FIX-pipe. If lora_buf comes back non-zero, FIX-pipe freeze after
-        // 32× TStoreAccFp is confirmed (#126 evidence).
-
-        // ===== LoRA-up cube pass =====
-        // Single fp16×fp16 mad: la_fp16 [M, R] × lu_T [R, N] → fp32 acc → lora_buf [M, N].
-        // Host must allocate lora_buf with at::zeros (NOT at::empty) — empty
-        // leaves the GM line cold and cube fixpipe TSTORE doesn't reliably
-        // land. See docs/gotchas/ascend.md "tensor.cpu() can return prior
-        // fill" for the symptom story.
-        constexpr uint64_t kL1LAOffset  = 16u * 1024;
-        constexpr uint64_t kL1LUTOffset = kL1LAOffset + (uint64_t)kBM * kR * sizeof(half);
-
-        // Both tiles use ND2NZ (BLayout=ColMajor + SLayout=RowMajor) because
-        // the GM tensors for la_fp16 [M, R] and lu_T [R, N] are both row-major.
-        using TileMatLA  = pto::Tile<pto::TileType::Mat, half, kBM, kR,
-                                      pto::BLayout::ColMajor, kBM, kR,
-                                      pto::SLayout::RowMajor, 512>;
-        using TileMatLUT = pto::Tile<pto::TileType::Mat, half, kR, kBN,
-                                      pto::BLayout::ColMajor, kR, kBN,
-                                      pto::SLayout::RowMajor, 512>;
-        using TileAccLora = pto::TileAcc<float, kBM, kBN, kBM, kBN>;
-        using LeftTileLora  = pto::TileLeft<half, kBM, kR, kBM, kR>;
-        using RightTileLora = pto::TileRight<half, kR, kBN, kR, kBN>;
-
-        using GlobalLA = pto::GlobalTensor<half,
-            pto::Shape<1, 1, 1, kBM, kR>,
-            pto::Stride<1, 1, 1, kR, 1>>;
-        using GlobalLUT = pto::GlobalTensor<half,
-            pto::Shape<1, 1, 1, kR, kBN>,
-            pto::Stride<1, 1, 1, kBN, 1>>;
-        // LoRA hand-off GM: separate fp32 [M, N] tensor (p->lora_buf).
-        using GlobalLoraBuf = pto::GlobalTensor<float,
-            pto::Shape<1, 1, 1, kBM, kBN>,
-            pto::Stride<1, 1, 1, kBN, 1>>;
-
-        TileMatLA   laMatTile;
-        TileMatLUT  lutMatTile;
-        TileAccLora loraAccTile;
-        TASSIGN(laMatTile,   kL1LAOffset);
-        TASSIGN(lutMatTile,  kL1LUTOffset);
-        TASSIGN(loraAccTile, 0u);  // L0C BUF0 (after main K-loop drain)
-
-        // 3c-4: la_fp16 sliced per-block (each block has its own [kBM, R]
-        // strip), lu_T is shared across blocks.
-        GlobalLA  laGlobal((__gm__ half*)p->la_fp16 + (uint64_t)block_idx * kBM * kR);
-        GlobalLUT lutGlobal((__gm__ half*)p->lu_T);
-
-        TLOAD(laMatTile, laGlobal);
-        TLOAD(lutMatTile, lutGlobal);
-
-        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
-        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
-
-        LeftTileLora  aLoraL0;
-        RightTileLora bLoraL0;
-        TASSIGN(aLoraL0, 0u);  // L0A BUF0
-        TASSIGN(bLoraL0, 0u);  // L0B BUF0
-
-        TEXTRACT(aLoraL0, laMatTile,  0, 0);
-        TEXTRACT(bLoraL0, lutMatTile, 0, 0);
-
-        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-
-        TMATMUL(loraAccTile, aLoraL0, bLoraL0);
-
-        set_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
-        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID2);
-
-        // TSTORE L0C fp32 accumulator → this block's lora_buf [kBM, N] slice.
-        GlobalLoraBuf loraBufGm((__gm__ float*)p->lora_buf
-                                + (uint64_t)block_idx * kBM * kBN);
-        TSTORE(loraBufGm, loraAccTile);
-
-        // Signal vec that lora_buf holds the fp32 LoRA result.
-        ffts_cross_core_sync(PIPE_FIX,
-                              pto::getFFTSMsg(0x2, LORA_BUF_READY));
+        // 3c-7 PROBE #128: LoRA pass already ran BEFORE K-loop (pristine
+        // cube). lora_buf was written, LORA_BUF_READY was fired. No post-
+        // K-loop LoRA work needed.
     }
 
     if ASCEND_IS_AIV {
