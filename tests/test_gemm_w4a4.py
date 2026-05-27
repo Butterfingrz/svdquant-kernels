@@ -190,6 +190,13 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
             f"mean_abs={lb_diff.mean().item():.4g} "
             f"any_nan_in_diff={lb_diff.isnan().any().item()}"
         )
+        # NOTE: do NOT assert on lora_buf — it's a cube→GM write that
+        # vec re-reads via L2. tensor.cpu() goes through HBM and can
+        # legitimately return the at::zeros initial state even when vec
+        # gets the correct values. See docs/gotchas/ascend.md
+        # "tensor.cpu() can return prior fill". The authoritative LoRA
+        # presence check is the out_vs_no_lora assertion at the bottom
+        # of this test.
 
         # --- diagnostic 2: full output ---
         _step(_stats(ref.float(),  "ref       "))
@@ -241,9 +248,31 @@ class TestGemmW4A4Phase3bInt4Lora(unittest.TestCase):
         #   cpu_recompute vs ref_no_lora ≫ 0.001 → cube K-loop 写出 junk int32
         #   out vs cpu_recompute ≈ 0.001 → vec pipeline OK
         #   out vs cpu_recompute ≫ 0.001 → vec pipeline 污染(TCVT/TROW/TCOL/TADD)
+
+        # Primary assertion — main path + LoRA + epilogue all correct.
         torch.testing.assert_close(
             out_cpu, ref, rtol=5e-2, atol=5e-2,
             msg="phase 3b int4+lora output diverged from baseline ref",
+        )
+
+        # task #130 (3c-7 post-mortem) — explicit LoRA-presence check.
+        # `lora_buf.cpu()` is unreliable (see note above). Instead, prove
+        # the LoRA codepath actually contributed to `out` by checking that
+        # `out` is closer to `ref` (with LoRA) than to `ref_no_lora`.
+        # In a healthy run: out_vs_ref ≈ fp16 noise (~0.008), out_vs_no_lora
+        # ≈ max_abs(lora_term) (~0.09); ratio ~10×.
+        # In a missing-LoRA run: out_vs_ref ≈ out_vs_no_lora ≈ lora_term.
+        out_vs_ref = (out_cpu.float() - ref.float()).abs().max().item()
+        out_vs_no_lora = (out_cpu.float() - ref_no_lora).abs().max().item()
+        self.assertLess(
+            out_vs_ref, out_vs_no_lora,
+            msg=(
+                f"LoRA contribution missing from `out`: "
+                f"out_vs_ref={out_vs_ref:.4g} not less than "
+                f"out_vs_no_lora={out_vs_no_lora:.4g}. "
+                f"`out` matches zero-LoRA reference at least as well as "
+                f"full reference — LoRA-up path produced no effect."
+            ),
         )
         _step("test_phase3b_int4_lora_path: pass")
 

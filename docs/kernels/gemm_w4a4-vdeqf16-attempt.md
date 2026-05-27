@@ -1,11 +1,22 @@
 # gemm_w4a4 VDEQF16 fold — abandoned 3c-7 attempt (2026-05-27)
 
 Phase 3c-7 tried to fold per-N wscale apply from vec (`TCOLEXPANDMUL`) into
-cube FIX-pipe via `TSTORE_FP<..., VDEQF16>` during the L0C drain. Main path
-worked numerically; LoRA-up cube pass silently broke (`lora_buf` returned
-exact zeros, not garbage). 5 debug probes failed to localize the cause.
-Abandoned; reverted to 3c-5 (`a58a5ac`) for production. Document here so a
-future attempt doesn't repeat the same dead ends.
+cube FIX-pipe via `TSTORE_FP<..., VDEQF16>` during the L0C drain. The host
+op changes broke the main path (`out` magnitude ~0.17 vs ref ~21 at probe
+#128 — `assert_close` FAIL). I spent 5 probes chasing `lora_buf=0` in the
+NPU log, not realizing the **3c-5 production baseline (`a58a5ac`) ALSO
+shows `lora_buf.cpu()=0`** — that reading is a known
+`tensor.cpu()`-on-cube-write artifact (see `docs/gotchas/ascend.md`
+"tensor.cpu() can return prior fill"), NOT a correctness break.
+Abandoned; reverted to 3c-5 for production. Document here so a future
+attempt doesn't repeat the same dead ends.
+
+**Meta-lesson**: the entire 5-probe debug arc was a wild goose chase. The
+real symptom was `out vs ref max_abs=21.92` (`assert_close` FAIL on main
+path); the `lora_buf=0` print was a red herring that existed pre-3c-7 too.
+Test now asserts `out_vs_ref < out_vs_ref_no_lora` (LoRA contribution
+present in `out`) instead of trusting the `_step()` print on `lora_buf`.
+See task #131 / commit fixing `tests/test_gemm_w4a4.py`.
 
 ## Motivation (from `docs/npu.md` perf snapshot)
 
@@ -63,19 +74,27 @@ Host validation (`tests/test_vdeqf16_pack.py`, 3 assertions):
 
 All 3 host invariants passed.
 
-## What worked on NPU
+## What I MISREAD as "main path worked" (it didn't)
 
-`out` from the main path looks reasonable: zero-LoRA test has
-`max_abs(out vs ref(zero-lora)) = 0.2656`, mean_abs = 0.019. That's ≈ 10
-fp16 ULP at output magnitude — fp16 cast in VDEQF16 hardware rounding
-appears looser than my host-side simulated `(partial.f32() *
-w.f32()).clamp().to(fp16)`. Acceptable for compute-bound paths but
-measurably wider than the ~0.001 max_abs of the 3a INT4 path. Could be
-tightened later by using `pto::F322F16` quant on a fp32 acc + fp32
-scale instead of int32 acc + uint64 mini-float — out of scope for the
-abandoned attempt.
+The host-side VDEQF16 round-trip test (`tests/test_vdeqf16_pack.py`)
+passes — the *math* of the fold is correct in software simulation. That's
+all that ever validated. **No 3c-7 NPU run ever passed
+`assert_close(out, ref)`** — probe #128's actual log shows
+`out vs ref max_abs=21.92 mean_abs=3.046` with `out` magnitude collapsed
+to `±0.17` while `ref` was `±21`. The kernel was writing tiny values, not
+the dequantized partials I expected. (See `tmp/3c7-128/test.log` on
+`scratch/3c7-128`.)
 
-Confirmed:
+What I should have caught earlier: 3c-5 baseline (`a58a5ac`) ALSO shows
+`lora_buf.cpu()=0` in its validation log (`tmp/3c5/test.log` on commit
+`580c001 3c5 validated`) — yet that build's `out vs ref` is `0.007812`,
+well inside `atol=5e-2`, and assert passes. The `lora_buf=0` print is
+the cube-write/host-read artifact from `docs/gotchas/ascend.md`
+"`tensor.cpu()` can return prior fill"; vec reads the LoRA partials from
+L2 (not from HBM `lora_buf`) and the LoRA contribution lands in `out`
+correctly. The print is *measurement noise*, not a kernel bug.
+
+Confirmed (for future revivers):
 
 - `TStoreAccFp` is fully implemented in our build path. Local
   `pto-isa/include/pto/npu/a2a3/TStore.hpp:470` has the real body
@@ -86,25 +105,47 @@ Confirmed:
   include` precedes the CANN tree); `arch_macro.hpp:14-15` auto-defines
   `PTO_NPU_ARCH_A2A3` from ccec's `--cce-aicore-arch=dav-c220-cube`
   (sets `__NPU_ARCH__=2201`), so the local A2/A3 dispatch fires.
-- Main path values are non-zero and bounded — proves cube TStoreAccFp is
-  writing ring slots; vec is reading them; the `× wscale` fold is
-  numerically correct (just slightly looser rounding than host sim).
+- The host-side packed-deqscalar layout (uint64, 19-bit mini-float at
+  bits[32:13]) is bit-exact to PTO's tstore_acc2gm testcase decoder.
+  Whatever broke `out` on device, it wasn't this.
 
-## What broke — `lora_buf` exact zero
+## What actually broke — `out` magnitude collapse
 
-LoRA-up cube pass (`la_fp16[M,R] @ lu_T[R,N] → lora_buf[M,N]` fp32) writes
-EXACT zero in all probe runs. Not NaN, not garbage, not "small but wrong"
-— literally `min=0 max=0 mean=0`. Reference `ref_lora_buf` has range
-`[-0.091, 0.087]`.
+3c-7 `test_phase3b_int4_lora_path` on probe #128:
 
-Symptom signature: `lora_buf` has the at::zeros initial state intact ⇒
-either the LoRA TSTORE silently no-ops, or the LoRA TMATMUL produces zero
-output, or the LoRA TLOAD reads zero inputs.
+```
+ref      : min=-21.88 max=20.06 mean=0.01025
+out      : min=-0.1726 max=0.188 mean=0.002765
+out vs ref: max_abs=21.92 mean_abs=3.046  → assert_close FAIL
+```
 
-## Debug probes (all NEGATIVE)
+The kernel runs to completion (no aicore exception), but `out` is ~100×
+smaller in magnitude than expected. Root cause never localized. Five
+probes (#125-#129) all chased the wrong target (`lora_buf=0` print) and
+left this signal untouched. Possible causes:
+
+- `workspace` dtype change int32→fp16 corrupted vec's `TLOAD(ringSlot)`
+  if some path still reads it as int32 (post-`TCVT` accumulator alignment)
+- The VDEQF16 FBuffer mini-float bit layout disagrees with hardware's
+  decoder at runtime even though host sim matches (e.g., hardware
+  expects FP8 not FP19; the testcase decoder may not be the production
+  decoder)
+- The K-loop's per-iter `TMOV(L1→FBuffer)` for the next wscale_packed
+  collides with the just-launched `TSTORE_FP`'s FBuffer read
+
+None tested before abandon.
+
+## Debug probes (all NEGATIVE — and all chasing the wrong signal)
 
 Each probe ran on 910B3 via WebIDE git transit (`scratch/3c7-*` branches
 on gitcode, `tmp/3c7-N/test.log`). Cube cost ≈ 30 mins Space credit total.
+
+**All 5 probes targeted "`lora_buf` is zero in the host-side print".**
+That target was wrong — as the post-mortem above explains, `lora_buf=0`
+also shows up in the *working* 3c-5 baseline. The real failure signal,
+present in all 5 logs but unnoticed, was `out vs ref max_abs ≈ 21` (main
+path collapsed to ~0.17 magnitude). None of the probes were designed to
+investigate that.
 
 ### #125 — set_fpc(0) before LoRA
 
@@ -181,27 +222,36 @@ midway. No LoRA signal — test errored instead of failing on assert.
 → Inconclusive; partial revert doesn't isolate kernel-only bugs without
 also reverting host.
 
-## Remaining unexplored hypotheses
+## Where a future revive should look first
 
-Each of these would need another Space round to test:
+The probes above all chased `lora_buf=0` (red herring). The real signal
+to debug is **`out` magnitude collapse to ~1/100 ref** at probe #128
+with LoRA pass *before* K-loop (which proves it's not a K-loop residue,
+because LoRA ran on pristine cube). Three places to look:
 
-1. **DeviceParams aggregate init type-deduction quirk** — `__gm__
-   uint64_t*` in aggregate init at the entry point. ccec might be doing
-   something nonobvious with the cast that affects downstream pointer
-   arithmetic. (Subtle; hard to test without disassembly.)
-2. **`auto_gen_kernel_device.cpp` wrapper drift** — when kernel signature
-   evolves over many commits, the auto-gen ascendc wrapper may keep
-   stale arg-positioning. BUILD_OK doesn't prove the wrapper actually
-   forwards args in correct order. Verifiable by inspecting
-   `build/auto_gen/.../auto_gen_kernel_device.cpp` and the `host_stub.cpp`
-   the wrapper produces. (Most testable next step.)
-3. **`torch_npu` fp32 NPU tensor `data_ptr()` returns unwritable GM**
-   when other ops in the same launch use fp16 workspace. Unlikely but
-   doesn't have a direct counter-test.
-4. **LoRA `TLOAD(la_fp16/lu_T)` silently fails** so mad sees zeros and
-   produces zero output, TSTORE writes zero correctly. Testable by
-   inserting a dummy probe that TLOADs la_fp16 + writes its first 256 B
-   to a known scratch GM via plain ubuf-TSTORE.
+1. **`workspace` dtype mismatch propagating through vec.** Vec's K-loop
+   reads `workspace[kb]` and does `TCVT` to fp32. If the host changed
+   `int32 → fp16` but vec's TLOAD still types it as int32 (because the
+   `TileData` C++ template wasn't updated symmetrically), every read
+   becomes raw fp16-as-int32 bits and `TCVT` produces garbage. Grep
+   `kernel_device.cpp` for the `TileData<int32_t, ...>` for ring slot
+   and confirm it tracks the host dtype switch.
+2. **`auto_gen_kernel_device.cpp` arg-position drift.** When kernel
+   signature evolves over many commits, the auto-gen ascendc wrapper
+   may keep stale arg-positioning. BUILD_OK doesn't prove the wrapper
+   forwards args in correct order — and a wscales pointer arriving in
+   the wrong slot would explain "out collapsed but kernel didn't fault".
+   Verifiable by inspecting `build/auto_gen/.../auto_gen_kernel_device
+   .cpp` against the current host signature.
+3. **VDEQF16 mini-float wire format ≠ PTO testcase decoder.** Our host
+   sim uses the bit layout from the PTO `tstore_acc2gm` testcase's
+   `extract_quant_params`. If hardware actually expects a different
+   encoding (e.g., FP8 sub-field, exponent bias offset), `out` would
+   come out small / nonsense. Diagnose by writing a known constant
+   (e.g., wscale=1.0 everywhere) and checking out matches an unscaled
+   int-acc reference.
+
+Stop debugging `lora_buf`. It's a measurement artifact.
 
 ## Architectural notes worth preserving
 

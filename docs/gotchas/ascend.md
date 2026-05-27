@@ -510,3 +510,18 @@ matters for cube fixpipe → vec MTE2 hand-offs but not for cube
 fixpipe → host `.cpu()` (which goes through a different read path
 and tolerates the deferred state). Cost is one extra D2H init —
 negligible vs. the LoRA bring-up cycles burnt diagnosing this.
+
+**Recidivism warning**: the 3c-7 VDEQF16 fold attempt
+(`docs/kernels/gemm_w4a4-vdeqf16-attempt.md`) walked right into
+this trap a second time, even though this gotcha was written
+during 3b-6. The 3c-5 production baseline ALSO shows
+`lora_buf.cpu() == 0` — that print was *normal*, not a bug. Five
+NPU probes (≈ 30 min Space credit) chased a phantom while the
+real signal — `assert_close(out, ref)` FAIL with `out` magnitude
+~1/100 of `ref` — was sitting in the same log file ignored.
+**Tests must assert on `out` (the final tensor vec writes), not
+on `lora_buf` or other cube-write/host-read intermediates.** Use
+`assertLess(out_vs_ref, out_vs_no_lora)` to prove the LoRA path
+contributes, instead of trusting `lora_buf.cpu()` directly. See
+`tests/test_gemm_w4a4.py::test_phase3b_int4_lora_path` for the
+template.
