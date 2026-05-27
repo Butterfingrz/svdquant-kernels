@@ -400,16 +400,43 @@ svdquant_gemm_w4a4_kernel(GM_ADDR act_in,         GM_ADDR wgt_in,
             wait_flag_dev(VEC_TILE_CONSUMED);
         }
 
-        // 3c-7 debug probe (task #125): reset FPC register before LoRA pass.
-        // K-loop's last TStore_FP left FPC pointing at FBuffer Scaling tile
-        // (wscale_packed for K-block 31). LoRA's plain TSTORE auto-selects
-        // QuantMode=NoQuant via GetCastPreQuantMode<float,float>, which per
-        // PTO ISA spec should ignore FPC — but the initial 3c-7 NPU run
-        // (a20877f) returned lora_buf all-zeros, suggesting the hardware
-        // fixpipe touches FPC even with NoQuant in some corner case.
-        // Point FPC at a benign zero address before LoRA TSTORE to rule out
-        // FPC residue.
+        // 3c-7 debug probe (task #126): force a plain NoQuant TSTORE drain
+        // to unwind FIX-pipe state before LoRA pass.
+        //
+        // Hypothesis: K-loop's 32 consecutive TStoreAccFp calls
+        // (pto-isa/.../a2a3/TStore.hpp:470) each set_fpc(deqTensorAddr) and
+        // drive the fixpipe through VDEQF16 mode. Even though
+        // GetCastPreQuantMode<float,float> returns NoQuant for LoRA's plain
+        // TSTORE, the hardware fixpipe state machine on dav_c220 may keep a
+        // sticky vector-quant latch that suppresses the subsequent NoQuant
+        // drain, manifesting as lora_buf all-zeros.
+        //
+        // Task #125's `set_fpc(0) + pipe_barrier(PIPE_FIX)` alone didn't
+        // help — confirms FPC register reset isn't enough; the state
+        // machine itself needs to be cycled through a NoQuant path.
+        //
+        // Probe: drain L0C's residual int32 (still holds kb=31 mad_s4
+        // partial) as plain int32 → int32 NoQuant via the standard
+        // TStoreAcc dispatch. Target is lora_buf reinterpreted as int32
+        // — its content is overwritten by the LoRA TSTORE 30 lines below,
+        // so the drain's actual bytes don't matter; we only care that the
+        // hardware took the plain-NoQuant code path. If LoRA's TSTORE
+        // succeeds after this, FIX-pipe state-machine residue is confirmed.
         set_fpc(0);
+        {
+            using TileAccCDrain = pto::TileAcc<int32_t, kBM, kBN, kBM, kBN>;
+            using GlobalLoraBufAsInt32 = pto::GlobalTensor<int32_t,
+                pto::Shape<1, 1, 1, kBM, kBN>,
+                pto::Stride<1, 1, 1, kBN, 1>>;
+            TileAccCDrain drainAcc;
+            TASSIGN(drainAcc, 0u);  // L0C BUF0 (int32 from kb=31 mad_s4)
+            GlobalLoraBufAsInt32 drainGm(
+                (__gm__ int32_t*)p->lora_buf
+                + (uint64_t)block_idx * kBM * kBN);
+            TSTORE(drainGm, drainAcc);
+            set_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
+            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
+        }
         pipe_barrier(PIPE_FIX);
 
         // ===== LoRA-up cube pass =====
