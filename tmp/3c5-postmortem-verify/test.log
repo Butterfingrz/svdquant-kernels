@@ -1,0 +1,48 @@
+[3a-test] importing torch
+/opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /opt/buildtools/Python-3.11.4/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+  warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+[3a-test]   torch 2.7.1+cpu
+[3a-test] importing torch_npu
+[3a-test]   torch_npu 2.7.1.post2.dev20251226 npu_available=True
+[3a-test] importing op_extension (loads libop_extension.so + runs __register_kernels)
+[3a-test]   op_extension loaded OK
+[3a-test] importing baseline.kernels.gemm_w4a4.ref_int4
+[3a-test]   baseline ref_int4 loaded OK
+test_phase3b_int4_lora_path (__main__.TestGemmW4A4Phase3bInt4Lora.test_phase3b_int4_lora_path) ... [3a-test] test_phase3b_int4_lora_path: enter
+[3a-test]   building INT4 inputs (CPU)
+[3a-test]   building reference (CPU)
+[3a-test]   ref shape (256, 256) max_abs=21.875
+[3a-test]   moving inputs to NPU
+[3a-test]   inputs on NPU OK
+[3a-test]   calling torch.ops.svdquant.gemm_w4a4_debug (task #109: triple-out)
+[3a-test]   op returned, syncing
+[3a-test]   sync OK, out shape (256, 256) dtype torch.float16
+[3a-test]   lora_buf shape (256, 256) dtype torch.float32
+[3a-test]   workspace shape (2, 6, 128, 256) dtype torch.int32
+[3a-test]   ref_lora_buf: any_nan=False any_inf=False min=-0.09134 max=0.0871 mean=4.124e-05
+[3a-test]   lora_buf : any_nan=False any_inf=False min=0 max=0 mean=0
+[3a-test]   lora_buf vs ref: max_abs=0.09134 mean_abs=0.0152 any_nan_in_diff=False
+[3a-test]   ref       : any_nan=False any_inf=False min=-21.88 max=20.06 mean=0.01025
+[3a-test]   out      : any_nan=False any_inf=False min=-21.88 max=20.06 mean=0.01025
+[3a-test]   out vs ref: max_abs=0.007812 mean_abs=3.616e-06 any_nan_in_out=False
+[3a-test]   ref_no_lora: any_nan=False any_inf=False min=-21.86 max=20.05 mean=0.01021
+[3a-test]   out vs ref_no_lora: max_abs=0.09134 mean_abs=0.0152
+[3a-test]   (skip cpu_recompute diagnostic: K_BLOCKS=32 > RING_SLOTS=6)
+[3a-test] test_phase3b_int4_lora_path: pass
+ok
+test_phase3b_zero_lora (__main__.TestGemmW4A4Phase3bInt4Lora.test_phase3b_zero_lora)
+task #107 (kept as 3c-1 regression coverage) — zero LoRA, real ... [3a-test] test_phase3b_zero_lora: enter
+[3a-test]   building INT4 inputs + zero LoRA + 3c-1 affine
+[3a-test]   ref max_abs=21.516
+[3a-test]   lora_buf  : any_nan=False min=0 max=0 mean=0
+[3a-test]   ref       : any_nan=False min=-21.52 max=20.69 mean=-0.0002075
+[3a-test]   out       : any_nan=False min=-21.52 max=20.69 mean=-0.0002074
+[3a-test]   out vs ref(zero-lora): max_abs=0.007812 mean_abs=2.015e-06
+[3a-test]   (skip cpu_recompute diagnostic: K_BLOCKS=32 > RING_SLOTS=6)
+[3a-test] test_phase3b_zero_lora: pass (diagnostic only, no assert)
+ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 1.575s
+
+OK

@@ -1,0 +1,105 @@
+CMake Warning at CMakeLists.txt:31 (message):
+  svdquant: CUDA requested but no CUDA compiler found — disabling
+
+
+-- svdquant: Ascend enabled (CANN: /home/developer/Ascend/cann-8.5.2)
+-- svdquant: ascendc.cmake loaded (SOC_VERSION=ascend910b1)
+-- svdquant: kernel pod 'gemm_w4a4' includes ascendc device source
+-- Configuring done (0.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build
+[1/32] Performing build step for 'svdquant_gemm_w4a4_device_precompile'
+[1/2] Building CXX object CMakeFiles/precompile_obj.dir/mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o
+[2/2] cd /home/developer/Ascend/cann-8.5.2/compiler/tikcpp/ascendc_kernel_cmake/legacy_modules/util && /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/scripts/ascendc_python_wrapper.py extract_src_template.py /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_precompile-prefix/src/svdquant_gemm_w4a4_device_precompile-build/CMakeFiles/precompile_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o -d /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device
+[2/32] No install step for 'svdquant_gemm_w4a4_device_precompile'
+[3/32] Completed 'svdquant_gemm_w4a4_device_precompile'
+[4/32] Creating directories for 'svdquant_gemm_w4a4_device_preprocess'
+[5/32] No download step for 'svdquant_gemm_w4a4_device_preprocess'
+[6/32] No update step for 'svdquant_gemm_w4a4_device_preprocess'
+[7/32] No patch step for 'svdquant_gemm_w4a4_device_preprocess'
+[8/32] Performing configure step for 'svdquant_gemm_w4a4_device_preprocess'
+-- The C compiler identification is GNU 9.4.0
+-- The CXX compiler identification is GNU 9.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done (0.5s)
+-- Generating done (0.0s)
+-- Build files have been written to: /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build
+[9/32] Performing build step for 'svdquant_gemm_w4a4_device_preprocess'
+[1/6] Building CXX object CMakeFiles/preprocess_obj.dir/mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o
+[2/6] Building CXX object CMakeFiles/aic_obj.dir/mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o
+[3/6] cd /home/developer/Ascend/cann-8.5.2/compiler/tikcpp/ascendc_kernel_cmake/legacy_modules/util && bash merge_obj_text.sh -l /home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/aic_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o
+/home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/aic_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o -o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/aic_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o[4/6] Building CXX object CMakeFiles/aiv_obj.dir/mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o
+[5/6] cd /home/developer/Ascend/cann-8.5.2/compiler/tikcpp/ascendc_kernel_cmake/legacy_modules/util && bash merge_obj_text.sh -l /home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/aiv_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o
+
+/home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld -m aicorelinux -Ttext=0 /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/aiv_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o -o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/aiv_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o[6/6] cd /home/developer/Ascend/cann-8.5.2/compiler/tikcpp/ascendc_kernel_cmake/legacy_modules/util && /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/scripts/ascendc_python_wrapper.py extract_host_stub.py /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/preprocess_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o --dynamic-mode -d /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device -hd /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/include/svdquant_gemm_w4a4_device --aiv-o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/aiv_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o --aic-o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/CMakeFiles/aic_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/csrc/kernels/gemm_w4a4/ascend/kernel_device.cpp.o --build-mode c220 --compile-commands /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_preprocess-prefix/src/svdquant_gemm_w4a4_device_preprocess-build/compile_commands.json --generate-definition --run-mode npu
+
+[10/32] No install step for 'svdquant_gemm_w4a4_device_preprocess'
+[11/32] Completed 'svdquant_gemm_w4a4_device_preprocess'
+[12/32] Creating directories for 'svdquant_gemm_w4a4_device_aic_device'
+[13/32] Creating directories for 'svdquant_gemm_w4a4_device_aiv_device'
+[14/32] No download step for 'svdquant_gemm_w4a4_device_aic_device'
+[15/32] No download step for 'svdquant_gemm_w4a4_device_aiv_device'
+[16/32] No update step for 'svdquant_gemm_w4a4_device_aic_device'
+[17/32] No update step for 'svdquant_gemm_w4a4_device_aiv_device'
+[18/32] No patch step for 'svdquant_gemm_w4a4_device_aic_device'
+[19/32] No patch step for 'svdquant_gemm_w4a4_device_aiv_device'
+[20/32] Performing configure step for 'svdquant_gemm_w4a4_device_aic_device'
+-- The C compiler identification is GNU 9.4.0
+-- The CXX compiler identification is GNU 9.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done (0.5s)
+-- Generating done (0.0s)
+-- Build files have been written to: /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aic_device-prefix/src/svdquant_gemm_w4a4_device_aic_device-build
+[21/32] Performing configure step for 'svdquant_gemm_w4a4_device_aiv_device'
+-- The C compiler identification is GNU 9.4.0
+-- The CXX compiler identification is GNU 9.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done (0.5s)
+-- Generating done (0.0s)
+-- Build files have been written to: /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aiv_device-prefix/src/svdquant_gemm_w4a4_device_aiv_device-build
+[22/32] Performing build step for 'svdquant_gemm_w4a4_device_aic_device'
+[1/2] Building CXX object CMakeFiles/device_obj.dir/mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device/auto_gen_kernel_device.cpp.o
+[2/2] cd /home/developer/Ascend/cann-8.5.2/compiler/tikcpp/ascendc_kernel_cmake/legacy_modules/util && bash merge_obj.sh -l /home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld -o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aic_device_dir -n device.o -f /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aic_device_dir/mix_build.flag /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aic_device-prefix/src/svdquant_gemm_w4a4_device_aic_device-build/CMakeFiles/device_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device/auto_gen_kernel_device.cpp.o
+/home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aic_device-prefix/src/svdquant_gemm_w4a4_device_aic_device-build/CMakeFiles/device_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device/auto_gen_kernel_device.cpp.o -static -o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aic_device_dir/device.o
+[23/32] No install step for 'svdquant_gemm_w4a4_device_aic_device'
+[24/32] Completed 'svdquant_gemm_w4a4_device_aic_device'
+[25/32] Performing build step for 'svdquant_gemm_w4a4_device_aiv_device'
+[1/2] Building CXX object CMakeFiles/device_obj.dir/mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device/auto_gen_kernel_device.cpp.o
+[2/2] cd /home/developer/Ascend/cann-8.5.2/compiler/tikcpp/ascendc_kernel_cmake/legacy_modules/util && bash merge_obj.sh -l /home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld -o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aiv_device_dir -n device.o -f /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aiv_device_dir/mix_build.flag /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aiv_device-prefix/src/svdquant_gemm_w4a4_device_aiv_device-build/CMakeFiles/device_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device/auto_gen_kernel_device.cpp.o
+/home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld  -m aicorelinux -r  -Ttext=0 /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aiv_device-prefix/src/svdquant_gemm_w4a4_device_aiv_device-build/CMakeFiles/device_obj.dir/./mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device/auto_gen_kernel_device.cpp.o -static -o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aiv_device_dir/device.o
+[26/32] No install step for 'svdquant_gemm_w4a4_device_aiv_device'
+[27/32] Completed 'svdquant_gemm_w4a4_device_aiv_device'
+[28/32] cd /home/developer/Ascend/cann-8.5.2/compiler/tikcpp/ascendc_kernel_cmake/legacy_modules/util && bash merge_mix_obj.sh -l /home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld -o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_merge_obj_dir --aiv-dir /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aiv_device_dir --aic-dir /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aic_device_dir --build-type Release && /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/scripts/ascendc_python_wrapper.py update_host_stub.py /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/auto_gen/svdquant_gemm_w4a4_device /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_merge_obj_dir ascend910b1 svdquant_gemm_w4a4_device
+/home/developer/Ascend/cann-8.5.2/aarch64-linux/ccec_compiler/bin/ld.lld -x -m aicorelinux   -Ttext=0 /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aic_device_dir/device.o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_aiv_device_dir/device.o -static -o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_merge_obj_dir/device.o
+[29/32] 
+[30/32] Building CXX object csrc/kernels/CMakeFiles/svdquant_gemm_w4a4.dir/gemm_w4a4/ascend/kernel.cpp.o
+[31/32] Building CXX object csrc/kernels/CMakeFiles/svdquant_gemm_w4a4_device_host_stub_obj.dir/__/__/auto_gen/svdquant_gemm_w4a4_device/host_stub.cpp.o
+[32/32] Linking CXX static library lib/libsvdquant_gemm_w4a4_device.a
+/home/developer/Ascend/cann-8.5.2/bin/ascendc_pack_kernel /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/CMakeFiles/svdquant_gemm_w4a4_device_host_stub_obj.dir/./__/__/auto_gen/svdquant_gemm_w4a4_device/host_stub.cpp.o /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/svdquant_gemm_w4a4_device_merge_obj_dir/device.o 0 /mnt/workspace/gitCode/qq_42927189/svdquant-kernels/build/csrc/kernels/CMakeFiles/svdquant_gemm_w4a4_device_host_stub_obj.dir/./__/__/auto_gen/svdquant_gemm_w4a4_device/host_stub.cpp.o
